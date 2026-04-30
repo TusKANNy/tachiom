@@ -1,0 +1,48 @@
+# Tachiom IVF+PQ benchmark on MS MARCO
+# Two-stage retrieval: HNSW coarse centroids + two-level PQ residual encoding
+name        = "bench_tachiom_msmarco_two_levels_pq"
+title       = "Benchmark Tachiom IVF+PQ on MS MARCO"
+description = "Tachiom search with HNSW centroids and two-level PQ residuals on MS MARCO"
+
+build-command = "./target/release/tachiom_build"
+query-command = "./target/release/tachiom_search"
+
+[settings]
+k        = 10
+num-runs = 1
+#NUMA     = "numactl --physcpubind='0' --localalloc"
+build    = false
+metric   = "RR@10"
+
+[folder]
+data       = "/data1/knn_datasets/dense_datasets/msmarco_v1_passage/colbert_v2"
+index      = "/data3/silvio/indexes/tachiom"
+experiment = "."
+qrels_path = "/data1/knn_datasets/sparse_datasets/msmarco_v1_passage/qrels.dev.small.tsv"
+
+[filename]
+vectors   = "vectors.npy"                    # [N, dim] f16 token vectors
+token_ids = "token_ids.npy"                 # [N] token type IDs (i64 or u32)
+doclens   = "doclens.npy"                   # [n_docs] document lengths
+queries   = "queries.npy"                    # [n_queries, n_tokens, dim] f32 query vectors
+index     = "tachiom_msmarco_4M_normalized" # output/input index filename
+doc_ids   = "doc_ids.npy"                   # optional: maps integer doc indices to string IDs
+query_ids = "queries_ids.npy"               # optional: maps integer query indices to string IDs
+
+[build_params]
+total-centroids = 4194304   # 4M centroid budget for TAC
+tac-n-iter      = 10
+pq-sample-size  = 10000000
+pq-n-iter       = 10
+normalize       = true
+pq-seed         = 42
+hnsw-m          = 32
+ef-construction = 1500
+pq-subspaces    = 32
+
+[query]
+    [query.ef30_kc20_kd500_a04]
+    ef-search       = 30
+    k-centroids     = 20
+    k-docs-to-score = 500
+    alpha           = 0.4

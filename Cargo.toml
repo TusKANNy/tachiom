@@ -1,0 +1,26 @@
+[package]
+name = "tachiom_private"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+half        = { version = "2.4", features = ["serde", "std", "num-traits"] }
+rustc-hash  = "2.1"
+serde       = { version = "1.0", features = ["derive"] }
+rand        = "0.8"
+rayon       = "1.10"
+anyhow      = "1.0"
+clap        = { version = "4.3", features = ["derive"] }
+ndarray     = "0.16"
+ndarray-npy = "0.9"
+vectorium   = { git = "ssh://git@github.com/TusKANNy/vectorium_private.git", branch = "feature/tachiom" }
+kannolo     = { git = "ssh://git@github.com/TusKANNy/kannolo_private.git", branch = "tachiom" }
+
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = false
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
