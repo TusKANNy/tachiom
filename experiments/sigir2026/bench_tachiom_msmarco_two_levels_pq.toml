@@ -10,7 +10,7 @@ query-command = "./target/release/tachiom_search"
 [settings]
 k        = 10
 num-runs = 1
-#NUMA     = "numactl --physcpubind='0' --localalloc"
+NUMA     = "numactl --physcpubind='0' --localalloc"
 build    = false
 metric   = "RR@10"
 

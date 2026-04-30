@@ -144,21 +144,21 @@ fn main() -> anyhow::Result<()> {
     let mut total_time_us = 0u128;
     let mut results = Vec::<(f32, usize)>::with_capacity(n_queries * args.k);
 
+    let t0 = Instant::now();
     for run in 0..args.num_runs {
         if run > 0 {
             results.clear();
         }
-        total_time_us = 0;
         for q in 0..n_queries {
             let query = DenseMultiVectorView::new(&query_flat[q], query_dim);
-            let t0 = Instant::now();
+
             let scored = <Tachiom<32> as Index<TachiomInputDataset>>::search(
                 &index,
                 query,
                 args.k,
                 &search_params,
             );
-            total_time_us += t0.elapsed().as_micros();
+
             results.extend(
                 scored
                     .into_iter()
@@ -166,6 +166,7 @@ fn main() -> anyhow::Result<()> {
             );
         }
     }
+    total_time_us += t0.elapsed().as_micros();
 
     let avg_us = total_time_us / (n_queries * args.num_runs) as u128;
     println!("[######] Average Query Time: {avg_us} μs");

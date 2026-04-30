@@ -1,6 +1,7 @@
 use half::f16;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use vectorium::Distance;
 
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
@@ -15,7 +16,6 @@ use crate::tac::TacBuilder;
 
 use vectorium::core::dataset::ScoredVector;
 use vectorium::core::index::Index;
-use vectorium::core::vector::DenseVectorView;
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
 use vectorium::vector_encoder::{QueryEvaluator, VectorEncoder};
 use vectorium::{
@@ -55,6 +55,18 @@ impl PartialOrd for MinHeapScore {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// Retain only candidates whose score is within `alpha` fraction of the k-th best score.
+/// No-ops when `alpha` is `None`, `k` is 0, or `candidates` is empty.
+fn prune_by_alpha(candidates: &mut Vec<(u32, f32)>, alpha: Option<f32>, k: usize) {
+    let Some(alpha_val) = alpha else { return };
+    if candidates.is_empty() || k == 0 {
+        return;
+    }
+    let kth_idx = k.min(candidates.len()) - 1;
+    let threshold = candidates[kth_idx].1 - candidates[kth_idx].1.abs() * alpha_val;
+    candidates.retain(|&(_, s)| s >= threshold);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,9 +110,9 @@ impl<const M: usize> Tachiom<M> {
         assignments: &[usize],
         dataset: ResidualDataset<M>,
     ) -> Self {
-        let n_documents = dataset.len() as usize;
+        let n_documents = dataset.len();
 
-        let n_centroids = centroids.n_elements() as usize;
+        let n_centroids = centroids.n_elements();
 
         // Group documents per centroid (deduplicated via FxHashSet for faster hashing)
         let mut groups: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n_centroids];
@@ -124,12 +136,12 @@ impl<const M: usize> Tachiom<M> {
             let doc_tokens = (ds_offsets[doc_id + 1] - ds_offsets[doc_id]) / output_dim;
             for _ in 0..doc_tokens {
                 let c_id = assignments[token_idx];
-                if c_id >= n_centroids {
-                    panic!(
-                        "assignment centroid id {} >= n_centroids {}",
-                        c_id, n_centroids
-                    );
-                }
+                assert!(
+                    c_id < n_centroids,
+                    "assignment centroid id {} >= n_centroids {}",
+                    c_id,
+                    n_centroids
+                );
                 groups[c_id].insert(doc_id as u32);
                 token_idx += 1;
             }
@@ -141,9 +153,7 @@ impl<const M: usize> Tachiom<M> {
         offsets.push(0);
 
         for grp in groups.iter() {
-            for &doc_id in grp.iter() {
-                inverted_lists.push(doc_id);
-            }
+            inverted_lists.extend(grp.iter().copied());
             offsets.push(inverted_lists.len());
         }
 
@@ -163,6 +173,44 @@ impl<const M: usize> Tachiom<M> {
         }
     }
 
+    /// Stage 1: accumulate per-doc coarse scores across all query tokens.
+    ///
+    /// For each query token, probes `k_centroids` centroids via HNSW and records
+    /// the best centroid similarity per document, then adds it to `doc_scores`.
+    fn accumulate_coarse_scores(
+        &self,
+        query: vectorium::DenseMultiVectorView<'_, f32>,
+        k_centroids: usize,
+        search_params: &HNSWSearchConfiguration,
+        doc_scores: &mut FxHashMap<u32, f32>,
+    ) {
+        let mut best_per_doc: FxHashMap<u32, f32> = FxHashMap::default();
+        best_per_doc.reserve(128);
+
+        for q_token in query.iter_vectors() {
+            let centroids_res = self.centroids.search(q_token, k_centroids, search_params);
+
+            best_per_doc.clear();
+            for (cidx, dist) in centroids_res
+                .iter()
+                .map(|sv| (sv.vector as usize, sv.distance.distance()))
+            {
+                let off_start = self.offsets[cidx];
+                let off_end = self.offsets[cidx + 1];
+                for &doc_id in &self.inverted_lists[off_start..off_end] {
+                    best_per_doc
+                        .entry(doc_id)
+                        .and_modify(|prev| *prev = dist.max(*prev))
+                        .or_insert(dist);
+                }
+            }
+
+            for (&doc_id, &best_sim) in &best_per_doc {
+                *doc_scores.entry(doc_id).or_insert(0.0) += best_sim;
+            }
+        }
+    }
+
     /// Search the index for the k nearest neighbor documents to the query.
     ///
     /// # Arguments
@@ -173,6 +221,7 @@ impl<const M: usize> Tachiom<M> {
     /// * `ef_search` - The ef construction parameter for HNSW search
     /// * `alpha` - Optional pruning threshold (fraction relative to k-th score)
     /// * `beta` - Optional early termination staleness counter
+    #[allow(clippy::too_many_arguments)]
     pub fn search<'a>(
         &'a self,
         query: vectorium::DenseMultiVectorView<'a, f32>,
@@ -195,42 +244,9 @@ impl<const M: usize> Tachiom<M> {
             .with_early_termination(early_termination);
 
         let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
-        doc_scores.reserve(4096); // Accumulates docs from all tokens; expect thousands to tens of thousands
+        doc_scores.reserve(4096);
 
-        let n_query_tokens = query.num_vecs();
-        let query_dim = query.dim();
-        let mut best_per_doc: FxHashMap<u32, f32> = FxHashMap::default();
-        best_per_doc.reserve(128); // Per-token map, reused each iteration; pre-allocate reasonable size
-
-        for qi in 0..n_query_tokens {
-            let q_token_f32 = &query.values()[qi * query_dim..(qi + 1) * query_dim];
-            let q_token = DenseVectorView::new(q_token_f32);
-
-            let centroids_res = self.centroids.search(q_token, k_centroids, &search_params);
-
-            best_per_doc.clear();
-            for scored_vec in &centroids_res {
-                let cidx = scored_vec.vector as usize;
-                let dist = scored_vec.distance.0;
-                let off_start = self.offsets[cidx];
-                let off_end = if cidx + 1 < self.offsets.len() {
-                    self.offsets[cidx + 1]
-                } else {
-                    self.inverted_lists.len()
-                };
-
-                for &doc_id in self.inverted_lists[off_start..off_end].iter() {
-                    best_per_doc
-                        .entry(doc_id)
-                        .and_modify(|prev| *prev = dist.max(*prev))
-                        .or_insert(dist);
-                }
-            }
-
-            for (&doc_id, &best_sim) in best_per_doc.iter() {
-                *doc_scores.entry(doc_id).or_insert(0.0) += best_sim;
-            }
-        }
+        self.accumulate_coarse_scores(query, k_centroids, &search_params, &mut doc_scores);
 
         // Stage 2: Candidate selection and pruning
         let mut docs_with_scores: Vec<(u32, f32)> = doc_scores.into_iter().collect();
@@ -252,16 +268,7 @@ impl<const M: usize> Tachiom<M> {
 
         let mut candidates = docs_with_scores;
 
-        // Apply alpha-based pruning if specified
-        if let Some(alpha_val) = alpha {
-            if !candidates.is_empty() && k > 0 {
-                let kth_idx = std::cmp::min(k, candidates.len()) - 1;
-                // Handle negative scores gracefully (wider acceptance means a lower threshold)
-                let threshold = candidates[kth_idx].1 - candidates[kth_idx].1.abs() * alpha_val;
-                // Keep candidates with score >= threshold (more positive is better)
-                candidates.retain(|&(_, s)| s >= threshold);
-            }
-        }
+        prune_by_alpha(&mut candidates, alpha, k);
 
         // Stage 3: Full distance computation and top-k selection
 
@@ -278,59 +285,69 @@ impl<const M: usize> Tachiom<M> {
             query_evaluator.compute_distance(doc_view).0
         };
 
-        if beta.is_some() && candidates.len() >= k && k > 0 {
-            // Beta-based early termination: use a min-heap to avoid O(n log n) sorting per insertion
-            let mut heap: BinaryHeap<MinHeapScore> = BinaryHeap::with_capacity(k);
-            let beta_val = beta.unwrap();
+        if let Some(beta_val) = beta {
+            if candidates.len() >= k && k > 0 {
+                // Beta-based early termination: use a min-heap to avoid O(n log n) sorting per insertion
+                let mut heap: BinaryHeap<MinHeapScore> = BinaryHeap::with_capacity(k);
 
-            // Score first k documents
-            for (doc_id, _) in candidates.iter().take(k) {
-                let score = score_doc(*doc_id);
-                heap.push(MinHeapScore {
-                    score,
-                    doc_id: *doc_id,
-                });
-            }
+                // Score first k documents
+                for (doc_id, _) in candidates.iter().take(k) {
+                    let score = score_doc(*doc_id);
+                    heap.push(MinHeapScore {
+                        score,
+                        doc_id: *doc_id,
+                    });
+                }
 
-            // Score remaining candidates with early termination
-            let mut n_stalls = 0usize;
-            for (doc_id, _) in candidates.iter().skip(k) {
-                let score = score_doc(*doc_id);
+                // Score remaining candidates with early termination
+                let mut n_stalls = 0usize;
+                for (doc_id, _) in candidates.iter().skip(k) {
+                    let score = score_doc(*doc_id);
 
-                // Only insert if better than worst in heap
-                if let Some(worst) = heap.peek() {
-                    if score > worst.score {
-                        heap.push(MinHeapScore {
-                            score,
-                            doc_id: *doc_id,
-                        });
-                        if heap.len() > k {
-                            heap.pop();
-                        }
-                        n_stalls = 0;
-                    } else {
-                        n_stalls += 1;
-                        if n_stalls >= beta_val {
-                            break;
+                    // Only insert if better than worst in heap
+                    if let Some(worst) = heap.peek() {
+                        if score > worst.score {
+                            heap.push(MinHeapScore {
+                                score,
+                                doc_id: *doc_id,
+                            });
+                            if heap.len() > k {
+                                heap.pop();
+                            }
+                            n_stalls = 0;
+                        } else {
+                            n_stalls += 1;
+                            if n_stalls >= beta_val {
+                                break;
+                            }
                         }
                     }
                 }
-            }
 
-            // Extract results from heap
-            result_scores.reserve(heap.len());
-            while let Some(item) = heap.pop() {
-                result_scores.push((item.score, item.doc_id));
+                // Extract results from heap
+                result_scores.reserve(heap.len());
+                while let Some(item) = heap.pop() {
+                    result_scores.push((item.score, item.doc_id));
+                }
+                // Results come out in ascending order, so reverse for descending
+                result_scores.reverse();
+            } else {
+                // Score all candidates (beta set but candidates < k)
+                for (doc_id, _) in candidates.iter() {
+                    let score = score_doc(*doc_id);
+                    result_scores.push((score, *doc_id));
+                }
+                result_scores
+                    .sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+                result_scores.truncate(k);
             }
-            // Results come out in ascending order, so reverse for descending
-            result_scores.reverse();
         } else {
             // Score all candidates
             for (doc_id, _) in candidates.iter() {
                 let score = score_doc(*doc_id);
                 result_scores.push((score, *doc_id));
             }
-            result_scores.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            result_scores.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
             result_scores.truncate(k);
         }
 
