@@ -57,6 +57,17 @@ impl PartialOrd for MinHeapScore {
     }
 }
 
+/// Per-stage wall-clock timings for a single search call, in nanoseconds.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchTimings {
+    /// Stage 1: coarse-score accumulation (HNSW probes + IVF traversal).
+    pub stage1_ns: u128,
+    /// Stage 2: candidate selection (partition + sort + alpha pruning).
+    pub stage2_ns: u128,
+    /// Stage 3: full distance computation + top-k selection.
+    pub stage3_ns: u128,
+}
+
 /// Retain only candidates whose score is within `alpha` fraction of the k-th best score.
 /// No-ops when `alpha` is `None`, `k` is 0, or `candidates` is empty.
 fn prune_by_alpha(candidates: &mut Vec<(u32, f32)>, alpha: Option<f32>, k: usize) {
@@ -211,86 +222,57 @@ impl<const M: usize> Tachiom<M> {
         }
     }
 
-    /// Search the index for the k nearest neighbor documents to the query.
-    ///
-    /// # Arguments
-    /// * `query` - Query multivector in f32 format
-    /// * `k` - Number of final results to return
-    /// * `k_centroids` - Number of centroids to search
-    /// * `k_docs_to_score` - Maximum number of documents to rerank
-    /// * `ef_search` - The ef construction parameter for HNSW search
-    /// * `alpha` - Optional pruning threshold (fraction relative to k-th score)
-    /// * `beta` - Optional early termination staleness counter
-    #[allow(clippy::too_many_arguments)]
-    pub fn search<'a>(
-        &'a self,
-        query: vectorium::DenseMultiVectorView<'a, f32>,
+    /// Stage 2: turn the coarse-score map into a sorted, alpha-pruned candidate list.
+    fn select_candidates(
+        doc_scores: FxHashMap<u32, f32>,
         k: usize,
-        k_centroids: usize,
         k_docs_to_score: usize,
-        ef_search: usize,
         alpha: Option<f32>,
-        beta: Option<usize>,
-        lambda: Option<f32>,
-    ) -> Vec<(f32, u32)> {
-        let early_termination = if let Some(lambda_val) = lambda {
-            EarlyTerminationStrategy::DistanceAdaptive { lambda: lambda_val }
-        } else {
-            EarlyTerminationStrategy::None
-        };
-
-        let search_params = HNSWSearchConfiguration::default()
-            .with_ef_search(ef_search)
-            .with_early_termination(early_termination);
-
-        let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
-        doc_scores.reserve(4096);
-
-        self.accumulate_coarse_scores(query, k_centroids, &search_params, &mut doc_scores);
-
-        // Stage 2: Candidate selection and pruning
+    ) -> Vec<(u32, f32)> {
         let mut docs_with_scores: Vec<(u32, f32)> = doc_scores.into_iter().collect();
 
         let take_n = std::cmp::min(k_docs_to_score, docs_with_scores.len());
 
-        // Use partition instead of full sort: find the k-th best in O(n) instead of O(n log n)
+        // Partition at top-k position in O(n) instead of full O(n log n) sort.
         if docs_with_scores.len() > take_n {
-            // Partition at top-k position (score comparison is reversed for descending)
             docs_with_scores.select_nth_unstable_by(take_n - 1, |a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
             });
             docs_with_scores.truncate(take_n);
         }
 
-        // Sort only the top-k candidates (much smaller set now)
-        docs_with_scores
-            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(&b.0)));
+        docs_with_scores.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         let mut candidates = docs_with_scores;
-
         prune_by_alpha(&mut candidates, alpha, k);
+        candidates
+    }
 
-        // Stage 3: Full distance computation and top-k selection
-
-        // Use a simple vector to track top-k results (sorting at the end)
-        let mut result_scores: Vec<(f32, u32)> = Vec::new();
-
-        // Create the base evaluator once, giving it the full global norms vector
-        // Norms, if present, are embedded in the encoded payload and extracted internally
-        // by the evaluator. No external scratchpad or norm slice is needed.
+    /// Stage 3: rerank candidates with full PQ distances; honour beta-based early exit.
+    fn rerank_candidates(
+        &self,
+        query: vectorium::DenseMultiVectorView<'_, f32>,
+        candidates: &[(u32, f32)],
+        k: usize,
+        beta: Option<usize>,
+    ) -> Vec<(f32, u32)> {
         let query_evaluator = self.residuals.encoder().query_evaluator(query);
-
         let score_doc = |doc_id: u32| -> f32 {
             let doc_view = self.residuals.get(doc_id as u64);
             query_evaluator.compute_distance(doc_view).0
         };
 
+        let mut result_scores: Vec<(f32, u32)> = Vec::new();
+
         if let Some(beta_val) = beta {
             if candidates.len() >= k && k > 0 {
-                // Beta-based early termination: use a min-heap to avoid O(n log n) sorting per insertion
+                // Beta-based early termination: min-heap of size k.
                 let mut heap: BinaryHeap<MinHeapScore> = BinaryHeap::with_capacity(k);
 
-                // Score first k documents
                 for (doc_id, _) in candidates.iter().take(k) {
                     let score = score_doc(*doc_id);
                     heap.push(MinHeapScore {
@@ -299,12 +281,9 @@ impl<const M: usize> Tachiom<M> {
                     });
                 }
 
-                // Score remaining candidates with early termination
                 let mut n_stalls = 0usize;
                 for (doc_id, _) in candidates.iter().skip(k) {
                     let score = score_doc(*doc_id);
-
-                    // Only insert if better than worst in heap
                     if let Some(worst) = heap.peek() {
                         if score > worst.score {
                             heap.push(MinHeapScore {
@@ -324,34 +303,101 @@ impl<const M: usize> Tachiom<M> {
                     }
                 }
 
-                // Extract results from heap
                 result_scores.reserve(heap.len());
                 while let Some(item) = heap.pop() {
                     result_scores.push((item.score, item.doc_id));
                 }
-                // Results come out in ascending order, so reverse for descending
                 result_scores.reverse();
-            } else {
-                // Score all candidates (beta set but candidates < k)
-                for (doc_id, _) in candidates.iter() {
-                    let score = score_doc(*doc_id);
-                    result_scores.push((score, *doc_id));
-                }
-                result_scores
-                    .sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-                result_scores.truncate(k);
+                return result_scores;
             }
-        } else {
-            // Score all candidates
-            for (doc_id, _) in candidates.iter() {
-                let score = score_doc(*doc_id);
-                result_scores.push((score, *doc_id));
-            }
-            result_scores.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-            result_scores.truncate(k);
         }
 
+        // Fallback: score all candidates (no beta, or beta set but candidates < k).
+        for (doc_id, _) in candidates.iter() {
+            let score = score_doc(*doc_id);
+            result_scores.push((score, *doc_id));
+        }
+        result_scores.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        result_scores.truncate(k);
         result_scores
+    }
+
+    fn build_search_params(
+        ef_search: usize,
+        lambda: Option<f32>,
+    ) -> HNSWSearchConfiguration {
+        let early_termination = if let Some(lambda_val) = lambda {
+            EarlyTerminationStrategy::DistanceAdaptive { lambda: lambda_val }
+        } else {
+            EarlyTerminationStrategy::None
+        };
+        HNSWSearchConfiguration::default()
+            .with_ef_search(ef_search)
+            .with_early_termination(early_termination)
+    }
+
+    /// Search the index for the k nearest neighbor documents to the query.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search<'a>(
+        &'a self,
+        query: vectorium::DenseMultiVectorView<'a, f32>,
+        k: usize,
+        k_centroids: usize,
+        k_docs_to_score: usize,
+        ef_search: usize,
+        alpha: Option<f32>,
+        beta: Option<usize>,
+        lambda: Option<f32>,
+    ) -> Vec<(f32, u32)> {
+        let search_params = Self::build_search_params(ef_search, lambda);
+
+        let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
+        doc_scores.reserve(4096);
+        self.accumulate_coarse_scores(query, k_centroids, &search_params, &mut doc_scores);
+
+        let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha);
+        self.rerank_candidates(query, &candidates, k, beta)
+    }
+
+    /// Same as [`Self::search`] but returns per-stage timings. For benchmarking only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_timings<'a>(
+        &'a self,
+        query: vectorium::DenseMultiVectorView<'a, f32>,
+        k: usize,
+        k_centroids: usize,
+        k_docs_to_score: usize,
+        ef_search: usize,
+        alpha: Option<f32>,
+        beta: Option<usize>,
+        lambda: Option<f32>,
+    ) -> (Vec<(f32, u32)>, SearchTimings) {
+        use std::time::Instant;
+
+        let search_params = Self::build_search_params(ef_search, lambda);
+
+        let t0 = Instant::now();
+        let mut doc_scores: FxHashMap<u32, f32> = FxHashMap::default();
+        doc_scores.reserve(4096);
+        self.accumulate_coarse_scores(query, k_centroids, &search_params, &mut doc_scores);
+        let stage1_ns = t0.elapsed().as_nanos();
+
+        let t1 = Instant::now();
+        let candidates = Self::select_candidates(doc_scores, k, k_docs_to_score, alpha);
+        let stage2_ns = t1.elapsed().as_nanos();
+
+        let t2 = Instant::now();
+        let results = self.rerank_candidates(query, &candidates, k, beta);
+        let stage3_ns = t2.elapsed().as_nanos();
+
+        (
+            results,
+            SearchTimings {
+                stage1_ns,
+                stage2_ns,
+                stage3_ns,
+            },
+        )
     }
 }
 
@@ -623,7 +669,7 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             search_params.ef_search,
             search_params.alpha,
             search_params.beta,
-            search_params.lambda,
+            search_params.lambda,   
         )
         .into_iter()
         .map(|(score, doc_id)| ScoredVector {
