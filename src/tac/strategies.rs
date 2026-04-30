@@ -14,29 +14,31 @@ use std::time::Instant;
 
 /// Compute the spread measure (W_i) for a token group: sum of per-dimension variances.
 pub fn compute_spread_measure(data: &[f16], indices: &[usize], dim: usize) -> f64 {
-    if indices.is_empty() {
-        return 0.0;
+    let n = indices.len();
+    let inv_n_f32 = 1.0f32 / n as f32;
+
+    // Pass 1: accumulate means.
+    let mut means = vec![0.0f32; dim];
+    for &idx in indices {
+        // SAFETY: idx < n_vectors, so idx * dim + dim <= data.len()
+        let vec = unsafe { data.get_unchecked(idx * dim..(idx + 1) * dim) };
+        for (m, &v) in means.iter_mut().zip(vec.iter()) {
+            *m += v.to_f32();
+        }
+    }
+    for m in means.iter_mut() {
+        *m *= inv_n_f32;
     }
 
-    let n = indices.len() as f64;
+    // Pass 2: accumulate squared deviations.
+    let mut total_variance = 0.0f64;
+    for &idx in indices {
+        // SAFETY: same as above
+        let vec = unsafe { data.get_unchecked(idx * dim..(idx + 1) * dim) };
+        total_variance += compute_squared_diff(vec, &means);
+    }
 
-    let means: Vec<f32> = (0..dim)
-        .into_par_iter()
-        .map(|d| {
-            let sum: f32 = indices
-                .iter()
-                .map(|&idx| data[idx * dim + d].to_f32())
-                .sum();
-            sum / n as f32
-        })
-        .collect();
-
-    let total_variance: f64 = indices
-        .par_iter()
-        .map(|&idx| compute_squared_diff(&data[idx * dim..(idx + 1) * dim], &means))
-        .sum();
-
-    total_variance / n
+    total_variance / n as f64
 }
 
 #[inline]
@@ -198,7 +200,7 @@ pub fn allocate_centroids_damped_spread(
     let spread_start = Instant::now();
 
     let spread_measures: Vec<(usize, usize, f64)> = active_tokens
-        .iter()
+        .par_iter()
         .map(|(token_id, count)| {
             let spread = compute_spread_measure(data, &token_groups[token_id], dim);
             (*token_id, *count, spread)

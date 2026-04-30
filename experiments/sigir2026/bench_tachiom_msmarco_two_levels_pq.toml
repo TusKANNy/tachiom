@@ -44,5 +44,5 @@ pq-subspaces    = 32
     [query.ef30_kc20_kd500_a04]
     ef-search       = 30
     k-centroids     = 20
-    k-docs-to-score = 500
+    k-docs-to-score = 4000
     alpha           = 0.4

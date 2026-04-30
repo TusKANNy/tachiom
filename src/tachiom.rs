@@ -322,10 +322,7 @@ impl<const M: usize> Tachiom<M> {
         result_scores
     }
 
-    fn build_search_params(
-        ef_search: usize,
-        lambda: Option<f32>,
-    ) -> HNSWSearchConfiguration {
+    fn build_search_params(ef_search: usize, lambda: Option<f32>) -> HNSWSearchConfiguration {
         let early_termination = if let Some(lambda_val) = lambda {
             EarlyTerminationStrategy::DistanceAdaptive { lambda: lambda_val }
         } else {
@@ -669,7 +666,7 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             search_params.ef_search,
             search_params.alpha,
             search_params.beta,
-            search_params.lambda,   
+            search_params.lambda,
         )
         .into_iter()
         .map(|(score, doc_id)| ScoredVector {

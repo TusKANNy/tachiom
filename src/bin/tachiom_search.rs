@@ -1,5 +1,5 @@
 use clap::Parser;
-use ndarray::{Array3, s};
+use ndarray::Array3;
 use ndarray_npy::ReadNpyExt;
 use std::fs::File;
 use std::io::{BufReader, Write};
@@ -8,7 +8,7 @@ use std::time::Instant;
 use tachiom_private::tachiom::{Tachiom, TachiomInputDataset, TachiomSearchParams};
 use vectorium::core::index::Index;
 use vectorium::distances::Distance;
-use vectorium::{DenseMultiVectorView, IndexSerializer};
+use vectorium::{Dataset, IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -122,43 +122,42 @@ fn main() -> anyhow::Result<()> {
         lambda: args.lambda,
     };
 
+    // ── Build query dataset (outside the timer) ───────────────────────────────
+    // queries_arr is C-contiguous (row-major) after read_npy, so as_slice() is safe.
+    let flat_queries: Box<[f32]> = queries_arr
+        .as_slice()
+        .expect("queries array must be C-contiguous")
+        .to_vec()
+        .into_boxed_slice();
+    let offsets: Box<[usize]> = (0..=n_queries)
+        .map(|i| i * n_tokens_per_query * query_dim)
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let query_dataset = MultiVectorDataset::from_raw(
+        flat_queries,
+        offsets,
+        PlainMultiVecQuantizer::<f32>::new(query_dim),
+    );
+
     println!(
         "\nSearching {} queries ({} runs)...",
         n_queries, args.num_runs
     );
 
-    // Pre-flatten all queries once to avoid repeated allocation in the hot path.
-    let query_flat: Vec<Vec<f32>> = (0..n_queries)
-        .map(|q| {
-            let mut v = Vec::with_capacity(n_tokens_per_query * query_dim);
-            let slice = queries_arr.slice(s![q, .., ..]);
-            for t in 0..n_tokens_per_query {
-                for d in 0..query_dim {
-                    v.push(slice[[t, d]]);
-                }
-            }
-            v
-        })
-        .collect();
-
     let mut total_time_us = 0u128;
     let mut results = Vec::<(f32, usize)>::with_capacity(n_queries * args.k);
 
     let t0 = Instant::now();
-    for run in 0..args.num_runs {
-        if run > 0 {
-            results.clear();
-        }
-        for q in 0..n_queries {
-            let query = DenseMultiVectorView::new(&query_flat[q], query_dim);
+    for _ in 0..args.num_runs {
+        results.clear();
 
+        for query in query_dataset.iter() {
             let scored = <Tachiom<32> as Index<TachiomInputDataset>>::search(
                 &index,
                 query,
                 args.k,
                 &search_params,
             );
-
             results.extend(
                 scored
                     .into_iter()

@@ -9,7 +9,7 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use kannolo::tac::TacBuilder;
+//! use tachiom_private::tac::TacBuilder;
 //!
 //! let tac = TacBuilder::new().n_iter(20).verbose(true).build();
 //! let result = tac.train(&data_f16, dim, &token_ids, total_centroids);
