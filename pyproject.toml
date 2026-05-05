@@ -1,0 +1,28 @@
+[build-system]
+requires      = ["maturin>=1.4,<2"]
+build-backend = "maturin"
+
+[project]
+name            = "tachiom"
+version         = "0.1.0"
+description     = "IVF-PQ index for late-interaction multivector retrieval"
+readme          = "README.md"
+requires-python = ">=3.9"
+license         = { text = "MIT" }
+authors         = [
+    { name = "Cosimo Rulli" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+    "numpy>=1.21",
+]
+
+[tool.maturin]
+module-name = "tachiom"
+features    = ["python"]

@@ -3,6 +3,13 @@ name = "tachiom_private"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+python  = ["dep:pyo3", "dep:numpy"]
+
 [dependencies]
 half        = { version = "2.4", features = ["serde", "std", "num-traits"] }
 rustc-hash  = "2.1"
@@ -13,6 +20,8 @@ anyhow      = "1.0"
 clap        = { version = "4.3", features = ["derive"] }
 ndarray     = "0.16"
 ndarray-npy = "0.9"
+pyo3        = { version = "0.24", features = ["extension-module"], optional = true }
+numpy       = { version = "0.24", optional = true }
 vectorium   = { git = "ssh://git@github.com/TusKANNy/vectorium_private.git", branch = "feature/tachiom" }
 kannolo     = { git = "ssh://git@github.com/TusKANNy/kannolo_private.git", branch = "tachiom" }
 

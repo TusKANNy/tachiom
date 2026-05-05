@@ -651,6 +651,79 @@ impl<const M: usize> Tachiom<M> {
         self.rerank_candidates(query, &candidates, k, beta)
     }
 
+    /// Search a batch of queries, optionally in parallel.
+    ///
+    /// `num_threads` controls the threading model:
+    /// - `0` — use rayon's default thread pool (typically all available cores).
+    /// - `1` — serial loop, no rayon involvement. Use this to reproduce single-thread
+    ///   benchmarks that pin the process via `numactl --physcpubind`.
+    /// - `n` — build a temporary rayon pool with `n` threads for the duration of this call.
+    ///
+    /// Returns one inner `Vec` per query (in input order), each holding the top-k
+    /// `(score, doc_id)` pairs in descending score order.  Inner vecs may be shorter
+    /// than `k` when beta-pruning fires early; callers needing a rectangular result
+    /// must pad themselves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_search<'a>(
+        &'a self,
+        queries: &[vectorium::DenseMultiVectorView<'a, f32>],
+        k: usize,
+        k_centroids: usize,
+        k_docs_to_score: usize,
+        ef_search: usize,
+        alpha: Option<f32>,
+        beta: Option<usize>,
+        lambda: Option<f32>,
+        num_threads: usize,
+    ) -> Vec<Vec<(f32, u32)>> {
+        use rayon::prelude::*;
+
+        let serial = || -> Vec<Vec<(f32, u32)>> {
+            queries
+                .iter()
+                .map(|q| {
+                    self.search(
+                        *q,
+                        k,
+                        k_centroids,
+                        k_docs_to_score,
+                        ef_search,
+                        alpha,
+                        beta,
+                        lambda,
+                    )
+                })
+                .collect()
+        };
+        let parallel = || -> Vec<Vec<(f32, u32)>> {
+            queries
+                .par_iter()
+                .map(|q| {
+                    self.search(
+                        *q,
+                        k,
+                        k_centroids,
+                        k_docs_to_score,
+                        ef_search,
+                        alpha,
+                        beta,
+                        lambda,
+                    )
+                })
+                .collect()
+        };
+
+        match num_threads {
+            1 => serial(),
+            0 => parallel(),
+            n => rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .expect("failed to build rayon thread pool")
+                .install(parallel),
+        }
+    }
+
     /// Same as [`Self::search`] but returns per-stage timings. For benchmarking only.
     #[allow(clippy::too_many_arguments)]
     pub fn search_with_timings<'a>(
@@ -726,6 +799,23 @@ pub struct TachiomBuildParams {
 
     /// HNSW build configuration for the coarse-centroid index.
     pub hnsw_params: HNSWBuildConfiguration,
+}
+
+impl Default for TachiomBuildParams {
+    fn default() -> Self {
+        Self {
+            token_ids: Vec::new(),
+            total_centroids: 4_194_304,
+            tac_n_iter: 10,
+            pq_sample_size: 10_000_000,
+            pq_n_iter: 10,
+            normalize: false,
+            pq_seed: Some(42),
+            hnsw_params: HNSWBuildConfiguration::default()
+                .with_num_neighbors(32)
+                .with_ef_construction(1500),
+        }
+    }
 }
 
 /// Parameters controlling a single [`Tachiom`] search.
