@@ -184,6 +184,300 @@ impl<const M: usize> Tachiom<M> {
         }
     }
 
+    /// Core build pipeline starting from pre-computed TAC output (steps 2–6).
+    ///
+    /// Runs PQ sample selection, encoder training, document encoding, HNSW construction,
+    /// and inverted-list assembly.  Called by both `build_index` (after TAC) and
+    /// `build_index_from_tac` (with externally supplied centroids/assignments).
+    fn build_from_tac_parts(
+        centroids_f16: Vec<f16>,
+        n_centroids: usize,
+        assignments_usize: Vec<usize>,
+        flat_f16: &[f16],
+        token_dim: usize,
+        doc_token_counts: &[usize],
+        params: &TachiomBuildParams,
+    ) -> Self {
+        let n_docs = doc_token_counts.len();
+        let n_tokens = flat_f16.len() / token_dim;
+
+        // ── Step 2: Select PQ training sample (damped proportional) ─────────────
+        // Score each token type with the same sqrt(count)*variance formula as TAC,
+        // then allocate pq_sample_size tokens using the largest-remainder method so
+        // the total is exact.
+        println!("[Tachiom::build_index] Step 2: Selecting PQ training sample...");
+        let (pq_train_flat, pq_train_assignments) = {
+            use rand::SeedableRng;
+            use rand::rngs::StdRng;
+            use rand::seq::SliceRandom;
+            use rayon::prelude::*;
+            use std::collections::HashMap;
+
+            let train_n = params.pq_sample_size.min(n_tokens);
+
+            let sample_indices: Vec<usize> = if train_n >= n_tokens {
+                (0..n_tokens).collect()
+            } else {
+                // Group indices by token type.
+                let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+                for (idx, &tid) in params.token_ids.iter().enumerate() {
+                    groups.entry(tid).or_default().push(idx);
+                }
+
+                // Score each token type: sqrt(count) * variance of (optionally normalised)
+                // residuals — matching the old train_multivec_pq behaviour.
+                // Welford single-pass variance; residuals computed on-the-fly from
+                // flat_f16 and the TAC centroids so nothing needs to be materialised.
+                let normalize = params.normalize;
+                let mut scored: Vec<(Vec<usize>, f64)> = groups
+                    .into_par_iter()
+                    .filter(|(_, v)| v.len() > 1)
+                    .map(|(_, indices)| {
+                        let n = indices.len();
+                        let mut count = 0usize;
+                        let mut means = vec![0.0f64; token_dim];
+                        let mut m2 = vec![0.0f64; token_dim];
+                        let mut res = vec![0.0f32; token_dim];
+
+                        for &idx in &indices {
+                            let t_base = idx * token_dim;
+                            let c_base = assignments_usize[idx] * token_dim;
+
+                            // Compute residual and its L2 norm in one pass.
+                            let mut sq = 0.0f32;
+                            for d in 0..token_dim {
+                                let r = flat_f16[t_base + d].to_f32()
+                                    - centroids_f16[c_base + d].to_f32();
+                                res[d] = r;
+                                sq += r * r;
+                            }
+                            let inv_norm = if normalize {
+                                1.0f32 / sq.sqrt().max(1e-12)
+                            } else {
+                                1.0f32
+                            };
+
+                            // Welford online update on the (normalised) residual.
+                            count += 1;
+                            for d in 0..token_dim {
+                                let r = res[d] * inv_norm;
+                                let delta = r as f64 - means[d];
+                                means[d] += delta / count as f64;
+                                m2[d] += delta * (r as f64 - means[d]);
+                            }
+                        }
+
+                        let variance = if n > 1 {
+                            m2.iter().sum::<f64>() / n as f64
+                        } else {
+                            0.0
+                        };
+                        let score = (n as f64).sqrt() * variance;
+                        (indices, score)
+                    })
+                    .collect();
+
+                let total_score: f64 = scored.iter().map(|(_, s)| *s).sum();
+
+                // Compute floating-point shares and floor allocations.
+                let shares: Vec<f64> = scored
+                    .iter()
+                    .map(|(indices, score)| {
+                        if total_score > 0.0 {
+                            (score / total_score) * train_n as f64
+                        } else {
+                            indices.len() as f64 / n_tokens as f64 * train_n as f64
+                        }
+                    })
+                    .collect();
+
+                let mut alloc: Vec<usize> = shares.iter().map(|s| s.floor() as usize).collect();
+
+                // Largest-remainder reconciliation: give +1 to types with biggest fractions
+                // until the total equals train_n exactly.
+                let deficit = train_n.saturating_sub(alloc.iter().sum::<usize>());
+                let mut order: Vec<usize> = (0..scored.len()).collect();
+                order.sort_unstable_by(|&a, &b| {
+                    let fa = shares[a] - alloc[a] as f64;
+                    let fb = shares[b] - alloc[b] as f64;
+                    fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for i in order.into_iter().take(deficit) {
+                    if alloc[i] < scored[i].0.len() {
+                        alloc[i] += 1;
+                    }
+                }
+
+                // Shuffle each group and take the allocated amount.
+                let mut rng = StdRng::seed_from_u64(42);
+                let mut out: Vec<usize> = Vec::with_capacity(train_n);
+                for (i, (indices, _)) in scored.iter_mut().enumerate() {
+                    let n_take = alloc[i].min(indices.len());
+                    if n_take > 0 {
+                        indices.shuffle(&mut rng);
+                        out.extend(indices.iter().take(n_take).copied());
+                    }
+                }
+
+                out.sort_unstable();
+                out
+            };
+
+            // Extract flat f16 data and assignments for the selected indices.
+            let mut flat: Vec<f16> = Vec::with_capacity(sample_indices.len() * token_dim);
+            let mut asgn: Vec<usize> = Vec::with_capacity(sample_indices.len());
+            for idx in &sample_indices {
+                flat.extend_from_slice(&flat_f16[idx * token_dim..(idx + 1) * token_dim]);
+                asgn.push(assignments_usize[*idx]);
+            }
+            (flat, asgn)
+        };
+
+        println!(
+            "[Tachiom::build_index] PQ training sample: {} tokens",
+            pq_train_flat.len() / token_dim
+        );
+
+        // ── Step 3: Build centroid dataset and train encoder ──────────────────
+        println!("[Tachiom::build_index] Step 3: Training encoder...");
+
+        let centroids_f32: Vec<f32> = centroids_f16.iter().map(|x| x.to_f32()).collect();
+
+        let coarse_centroids_ds = PlainDenseDataset::<f32, SquaredEuclideanDistance>::from_raw(
+            centroids_f32.into_boxed_slice(),
+            n_centroids,
+            PlainDenseQuantizer::<f32, SquaredEuclideanDistance>::new(token_dim),
+        );
+
+        // Pass the pre-selected training subset; sample_size >= n_train so no resampling occurs.
+        let n_train = pq_train_flat.len() / token_dim;
+        let encoder = MultiVecTwoLevelProductQuantizer::<M, f16>::train_from_coarse(
+            coarse_centroids_ds,
+            &pq_train_flat,
+            &pq_train_assignments,
+            n_train,
+            params.pq_n_iter,
+            params.normalize,
+            params.pq_seed,
+        );
+
+        // ── Step 4: Encode all documents ──────────────────────────────────────
+        // Use push_encoded_with_ids to bypass search_nearest over ncoarse centroids —
+        // with millions of centroids a brute-force search per token is infeasible.
+        // Instead we use the TAC assignments computed in Step 1 as direct lookups.
+        println!(
+            "[Tachiom::build_index] Step 3: Encoding {} documents...",
+            n_docs
+        );
+        let residuals = {
+            use rayon::prelude::*;
+            let output_dim = encoder.output_dim();
+
+            // Build cumulative token-start per document (needed to slice flat_f16 and assignments).
+            let mut token_starts = Vec::with_capacity(n_docs + 1);
+            token_starts.push(0usize);
+            for &n in doc_token_counts {
+                token_starts.push(token_starts.last().unwrap() + n);
+            }
+
+            let enc_ref = &encoder;
+            let f16_ref = flat_f16;
+            let asgn_ref = &assignments_usize;
+
+            // Encode each document in parallel; the pre-computed coarse IDs from TAC
+            // are used directly, so no centroid search is performed.
+            let encoded_docs: Vec<Vec<u8>> = (0..n_docs)
+                .into_par_iter()
+                .map(|doc_id| {
+                    let tok_start = token_starts[doc_id];
+                    let n_tok = doc_token_counts[doc_id];
+                    let tok_slice =
+                        &f16_ref[tok_start * token_dim..(tok_start + n_tok) * token_dim];
+                    let coarse_ids: Vec<u32> = asgn_ref[tok_start..tok_start + n_tok]
+                        .iter()
+                        .map(|&x| x as u32)
+                        .collect();
+                    let view = vectorium::DenseMultiVectorView::new(tok_slice, token_dim);
+                    let mut buf = Vec::with_capacity(n_tok * output_dim);
+                    enc_ref.push_encoded_with_ids(view, &coarse_ids, &mut buf);
+                    buf
+                })
+                .collect();
+
+            // Assemble flat encoded buffer and offsets.
+            let total_len: usize = encoded_docs.iter().map(|d| d.len()).sum();
+            let mut enc_data = Vec::with_capacity(total_len);
+            let mut enc_offsets: Vec<usize> = Vec::with_capacity(n_docs + 1);
+            enc_offsets.push(0);
+            for doc in &encoded_docs {
+                enc_data.extend_from_slice(doc);
+                enc_offsets.push(enc_data.len());
+            }
+
+            MultiVectorDataset::from_raw(
+                enc_data.into_boxed_slice(),
+                enc_offsets.into_boxed_slice(),
+                encoder,
+            )
+        };
+
+        // ── Step 5: Build HNSW on coarse centroids ────────────────────────────
+        println!(
+            "[Tachiom::build_index] Step 4: Building HNSW on {} centroids...",
+            n_centroids
+        );
+        let centroid_dataset: CentroidDataset = DenseDataset::from_raw(
+            centroids_f16.into_boxed_slice(),
+            n_centroids,
+            PlainDenseQuantizer::<f16, DotProduct>::new(token_dim),
+        );
+        let centroids_hnsw = HNSWCentroids::build_index(centroid_dataset, &params.hnsw_params);
+
+        // ── Step 6: Build inverted lists ──────────────────────────────────────
+        println!("[Tachiom::build_index] Step 5: Building inverted lists...");
+        Tachiom::from_parts(centroids_hnsw, &assignments_usize, residuals)
+    }
+
+    /// Build a Tachiom index from pre-computed TAC coarse centroids and assignments.
+    ///
+    /// Skips Token-Aware Clustering and runs PQ training, encoding, HNSW construction,
+    /// and inverted-list assembly using the supplied centroids and assignments.
+    /// Useful for isolating whether retrieval differences stem from the clustering step
+    /// or the residual/PQ encoding step.
+    pub fn build_index_from_tac(
+        centroids_f16: Vec<f16>,
+        n_centroids: usize,
+        assignments_usize: Vec<usize>,
+        dataset: TachiomInputDataset,
+        params: &TachiomBuildParams,
+    ) -> Self {
+        let token_dim = dataset.encoder().input_dim();
+        let flat_f16: &[f16] = dataset.values();
+        let doc_token_counts: Vec<usize> = dataset
+            .offsets()
+            .windows(2)
+            .map(|w| (w[1] - w[0]) / token_dim)
+            .collect();
+
+        println!(
+            "[Tachiom::build_index_from_tac] {} docs, {} tokens, dim={}, {} centroids",
+            doc_token_counts.len(),
+            flat_f16.len() / token_dim,
+            token_dim,
+            n_centroids
+        );
+
+        Self::build_from_tac_parts(
+            centroids_f16,
+            n_centroids,
+            assignments_usize,
+            flat_f16,
+            token_dim,
+            &doc_token_counts,
+            params,
+        )
+    }
+
     /// Stage 1: accumulate per-doc coarse scores across all query tokens.
     ///
     /// For each query token, probes `k_centroids` centroids via HNSW and records
@@ -268,48 +562,49 @@ impl<const M: usize> Tachiom<M> {
 
         let mut result_scores: Vec<(f32, u32)> = Vec::new();
 
-        if let Some(beta_val) = beta {
-            if candidates.len() >= k && k > 0 {
-                // Beta-based early termination: min-heap of size k.
-                let mut heap: BinaryHeap<MinHeapScore> = BinaryHeap::with_capacity(k);
+        if let Some(beta_val) = beta
+            && candidates.len() >= k
+            && k > 0
+        {
+            // Beta-based early termination: min-heap of size k.
+            let mut heap: BinaryHeap<MinHeapScore> = BinaryHeap::with_capacity(k);
 
-                for (doc_id, _) in candidates.iter().take(k) {
-                    let score = score_doc(*doc_id);
-                    heap.push(MinHeapScore {
-                        score,
-                        doc_id: *doc_id,
-                    });
-                }
+            for (doc_id, _) in candidates.iter().take(k) {
+                let score = score_doc(*doc_id);
+                heap.push(MinHeapScore {
+                    score,
+                    doc_id: *doc_id,
+                });
+            }
 
-                let mut n_stalls = 0usize;
-                for (doc_id, _) in candidates.iter().skip(k) {
-                    let score = score_doc(*doc_id);
-                    if let Some(worst) = heap.peek() {
-                        if score > worst.score {
-                            heap.push(MinHeapScore {
-                                score,
-                                doc_id: *doc_id,
-                            });
-                            if heap.len() > k {
-                                heap.pop();
-                            }
-                            n_stalls = 0;
-                        } else {
-                            n_stalls += 1;
-                            if n_stalls >= beta_val {
-                                break;
-                            }
+            let mut n_stalls = 0usize;
+            for (doc_id, _) in candidates.iter().skip(k) {
+                let score = score_doc(*doc_id);
+                if let Some(worst) = heap.peek() {
+                    if score > worst.score {
+                        heap.push(MinHeapScore {
+                            score,
+                            doc_id: *doc_id,
+                        });
+                        if heap.len() > k {
+                            heap.pop();
+                        }
+                        n_stalls = 0;
+                    } else {
+                        n_stalls += 1;
+                        if n_stalls >= beta_val {
+                            break;
                         }
                     }
                 }
-
-                result_scores.reserve(heap.len());
-                while let Some(item) = heap.pop() {
-                    result_scores.push((item.score, item.doc_id));
-                }
-                result_scores.reverse();
-                return result_scores;
             }
+
+            result_scores.reserve(heap.len());
+            while let Some(item) = heap.pop() {
+                result_scores.push((item.score, item.doc_id));
+            }
+            result_scores.reverse();
+            return result_scores;
         }
 
         // Fallback: score all candidates (no beta, or beta set but candidates < k).
@@ -552,104 +847,16 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             tac_result.assignments.iter().map(|&x| x as usize).collect();
         let centroids_f16 = tac_result.centroids;
 
-        // ── Step 2: Build centroid dataset (f16) and coarse centroids (f32) ───
-        println!("[Tachiom::build_index] Step 2: Building encoder...");
-
-        let centroids_f32: Vec<f32> = centroids_f16.iter().map(|x| x.to_f32()).collect();
-
-        let coarse_centroids_ds = PlainDenseDataset::<f32, SquaredEuclideanDistance>::from_raw(
-            centroids_f32.into_boxed_slice(),
+        // ── Steps 2–6: PQ training, encoding, HNSW, inverted lists ──────────────
+        Self::build_from_tac_parts(
+            centroids_f16,
             n_centroids,
-            PlainDenseQuantizer::<f32, SquaredEuclideanDistance>::new(token_dim),
-        );
-
-        // Pass flat_f16 directly — train_from_coarse converts to f32 on the fly
-        // for the sampled subset only, so no full N×D×4 copy is needed.
-        let encoder = MultiVecTwoLevelProductQuantizer::<M, f16>::train_from_coarse(
-            coarse_centroids_ds,
+            assignments_usize,
             flat_f16,
-            &assignments_usize,
-            params.pq_sample_size,
-            params.pq_n_iter,
-            params.normalize,
-            params.pq_seed,
-        );
-
-        // ── Step 3: Encode all documents ──────────────────────────────────────
-        // Use push_encoded_with_ids to bypass search_nearest over ncoarse centroids —
-        // with millions of centroids a brute-force search per token is infeasible.
-        // Instead we use the TAC assignments computed in Step 1 as direct lookups.
-        println!(
-            "[Tachiom::build_index] Step 3: Encoding {} documents...",
-            n_docs
-        );
-        let residuals = {
-            use rayon::prelude::*;
-            let output_dim = encoder.output_dim();
-
-            // Build cumulative token-start per document (needed to slice flat_f16 and assignments).
-            let mut token_starts = Vec::with_capacity(n_docs + 1);
-            token_starts.push(0usize);
-            for &n in &doc_token_counts {
-                token_starts.push(token_starts.last().unwrap() + n);
-            }
-
-            let enc_ref = &encoder;
-            let f16_ref = flat_f16;
-            let asgn_ref = &assignments_usize;
-
-            // Encode each document in parallel; the pre-computed coarse IDs from TAC
-            // are used directly, so no centroid search is performed.
-            let encoded_docs: Vec<Vec<u8>> = (0..n_docs)
-                .into_par_iter()
-                .map(|doc_id| {
-                    let tok_start = token_starts[doc_id];
-                    let n_tok = doc_token_counts[doc_id];
-                    let tok_slice =
-                        &f16_ref[tok_start * token_dim..(tok_start + n_tok) * token_dim];
-                    let coarse_ids: Vec<u32> = asgn_ref[tok_start..tok_start + n_tok]
-                        .iter()
-                        .map(|&x| x as u32)
-                        .collect();
-                    let view = vectorium::DenseMultiVectorView::new(tok_slice, token_dim);
-                    let mut buf = Vec::with_capacity(n_tok * output_dim);
-                    enc_ref.push_encoded_with_ids(view, &coarse_ids, &mut buf);
-                    buf
-                })
-                .collect();
-
-            // Assemble flat encoded buffer and offsets.
-            let total_len: usize = encoded_docs.iter().map(|d| d.len()).sum();
-            let mut enc_data = Vec::with_capacity(total_len);
-            let mut enc_offsets: Vec<usize> = Vec::with_capacity(n_docs + 1);
-            enc_offsets.push(0);
-            for doc in &encoded_docs {
-                enc_data.extend_from_slice(doc);
-                enc_offsets.push(enc_data.len());
-            }
-
-            MultiVectorDataset::from_raw(
-                enc_data.into_boxed_slice(),
-                enc_offsets.into_boxed_slice(),
-                encoder,
-            )
-        };
-
-        // ── Step 4: Build HNSW on coarse centroids ────────────────────────────
-        println!(
-            "[Tachiom::build_index] Step 4: Building HNSW on {} centroids...",
-            n_centroids
-        );
-        let centroid_dataset: CentroidDataset = DenseDataset::from_raw(
-            centroids_f16.into_boxed_slice(),
-            n_centroids,
-            PlainDenseQuantizer::<f16, DotProduct>::new(token_dim),
-        );
-        let centroids_hnsw = HNSWCentroids::build_index(centroid_dataset, &params.hnsw_params);
-
-        // ── Step 5: Build inverted lists ──────────────────────────────────────
-        println!("[Tachiom::build_index] Step 5: Building inverted lists...");
-        Tachiom::from_parts(centroids_hnsw, &assignments_usize, residuals)
+            token_dim,
+            &doc_token_counts,
+            params,
+        )
     }
 
     fn search<'q>(

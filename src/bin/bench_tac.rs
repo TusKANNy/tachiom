@@ -110,7 +110,10 @@ fn main() -> anyhow::Result<()> {
     // ── Save results ──────────────────────────────────────────────────────────
     println!("\n=== Saving Results ===");
 
-    let stem = format!("it{}_k{}_n{}", args.tac_n_iter, result.n_centroids, n_vectors);
+    let stem = format!(
+        "it{}_k{}_n{}",
+        args.tac_n_iter, result.n_centroids, n_vectors
+    );
 
     save_centroids(
         &result.centroids,

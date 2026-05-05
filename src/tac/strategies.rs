@@ -14,13 +14,16 @@ use std::time::Instant;
 
 /// Compute the spread measure (W_i) for a token group: sum of per-dimension variances.
 pub fn compute_spread_measure(data: &[f16], indices: &[usize], dim: usize) -> f64 {
+    if indices.is_empty() {
+        return 0.0;
+    }
+
     let n = indices.len();
     let inv_n_f32 = 1.0f32 / n as f32;
 
-    // Pass 1: accumulate means.
+    // Pass 1: accumulate means (row-major traversal — cache-friendly).
     let mut means = vec![0.0f32; dim];
     for &idx in indices {
-        // SAFETY: idx < n_vectors, so idx * dim + dim <= data.len()
         let vec = unsafe { data.get_unchecked(idx * dim..(idx + 1) * dim) };
         for (m, &v) in means.iter_mut().zip(vec.iter()) {
             *m += v.to_f32();
@@ -30,10 +33,9 @@ pub fn compute_spread_measure(data: &[f16], indices: &[usize], dim: usize) -> f6
         *m *= inv_n_f32;
     }
 
-    // Pass 2: accumulate squared deviations.
+    // Pass 2: accumulate squared deviations (sequential, deterministic).
     let mut total_variance = 0.0f64;
     for &idx in indices {
-        // SAFETY: same as above
         let vec = unsafe { data.get_unchecked(idx * dim..(idx + 1) * dim) };
         total_variance += compute_squared_diff(vec, &means);
     }

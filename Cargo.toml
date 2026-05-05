@@ -17,6 +17,9 @@ vectorium   = { git = "ssh://git@github.com/TusKANNy/vectorium_private.git", bra
 kannolo     = { git = "ssh://git@github.com/TusKANNy/kannolo_private.git", branch = "tachiom" }
 
 
+[patch."ssh://git@github.com/TusKANNy/vectorium_private.git"]
+vectorium = { path = "/home/smartinico/vectorium_private" }
+
 [profile.release]
 opt-level = 3
 debug = false

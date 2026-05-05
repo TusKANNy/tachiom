@@ -11,36 +11,36 @@ use vectorium::{IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
 
 #[derive(Parser, Debug)]
 #[clap(
-    author,
-    version,
-    about = "Build a Tachiom IVF-PQ index from a multivector (late-interaction) dataset"
+    about = "Build a Tachiom index from pre-built TAC output (coarse centroids + assignments).\n\
+                Skips Token-Aware Clustering and runs PQ training + encoding from scratch,\n\
+                letting you isolate whether quality differences come from clustering or residuals."
 )]
 struct Args {
-    /// Path to the f16 token-vector file (.npy, shape [N, dim])
+    /// [N, dim] f16 token-vector file (.npy)
     #[clap(short = 'i', long)]
     vectors_file: String,
 
-    /// Path to the token-type ID file (.npy, dtype i64 or u32, shape [N])
+    /// [N] token-type ID file (.npy, i64 or u32) — used for damped PQ sample selection
     #[clap(long)]
     token_ids_file: String,
 
-    /// Path to the document-length file (.npy, shape [n_docs])
+    /// [n_docs] document-length file (.npy)
     #[clap(long)]
     doclens_file: String,
+
+    /// [K, dim] f32 coarse centroids (.npy) — output of the old pipeline
+    #[clap(long)]
+    centroids_file: String,
+
+    /// [N] coarse centroid assignment per token (.npy, u64 or u32) — output of the old pipeline
+    #[clap(long)]
+    assignments_file: String,
 
     /// Output path for the serialized Tachiom index
     #[clap(short = 'o', long)]
     output_file: String,
 
-    /// Total coarse-centroid budget (TAC)
-    #[clap(long, default_value_t = 4_194_304)]
-    total_centroids: usize,
-
-    /// K-means iterations per token type in TAC
-    #[clap(long, default_value_t = 10)]
-    tac_n_iter: usize,
-
-    /// Tokens sampled for PQ training
+    /// Number of tokens sampled for PQ training
     #[clap(long, default_value_t = 10_000_000)]
     pq_sample_size: usize,
 
@@ -48,7 +48,7 @@ struct Args {
     #[clap(long, default_value_t = 10)]
     pq_n_iter: usize,
 
-    /// Normalise residuals before PQ (stores norms in payload)
+    /// Normalise residuals before PQ encoding (stores norms in payload)
     #[clap(long)]
     normalize: bool,
 
@@ -63,46 +63,32 @@ struct Args {
     /// HNSW ef_construction
     #[clap(long, default_value_t = 1500)]
     ef_construction: usize,
-
-    /// Number of PQ subspaces (only M=32 is currently supported)
-    #[clap(long, default_value_t = 32)]
-    pq_subspaces: usize,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    if args.pq_subspaces != 32 {
-        anyhow::bail!("Only --pq-subspaces 32 is currently supported");
-    }
-
-    println!("=== Tachiom Build ===");
-    println!("Vectors:         {}", args.vectors_file);
-    println!("Token IDs:       {}", args.token_ids_file);
-    println!("Doc lengths:     {}", args.doclens_file);
-    println!("Output:          {}", args.output_file);
-    println!("Total centroids: {}", args.total_centroids);
-    println!("TAC iters:       {}", args.tac_n_iter);
-    println!("PQ sample:       {}", args.pq_sample_size);
-    println!("PQ iters:        {}", args.pq_n_iter);
-    println!("Normalize:       {}", args.normalize);
-    println!("HNSW M:          {}", args.hnsw_m);
-    println!("HNSW ef_constr:  {}", args.ef_construction);
-    println!("CPU cores:       {}", rayon::current_num_threads());
+    println!("=== Tachiom Build From TAC ===");
+    println!("Vectors:        {}", args.vectors_file);
+    println!("Token IDs:      {}", args.token_ids_file);
+    println!("Doc lengths:    {}", args.doclens_file);
+    println!("Centroids:      {}", args.centroids_file);
+    println!("Assignments:    {}", args.assignments_file);
+    println!("Output:         {}", args.output_file);
+    println!("PQ sample:      {}", args.pq_sample_size);
+    println!("PQ iters:       {}", args.pq_n_iter);
+    println!("Normalize:      {}", args.normalize);
+    println!("HNSW M:         {}", args.hnsw_m);
+    println!("HNSW ef_constr: {}", args.ef_construction);
+    println!("CPU cores:      {}", rayon::current_num_threads());
 
     let total_start = Instant::now();
 
     // ── Load token vectors (f16) ──────────────────────────────────────────────
     println!("\nLoading token vectors...");
-    let load_start = Instant::now();
     let (flat_f16, dim) = read_f16_npy(&args.vectors_file)?;
     let n_tokens = flat_f16.len() / dim;
-    println!(
-        "  {} tokens × dim={} in {:.2?}",
-        n_tokens,
-        dim,
-        load_start.elapsed()
-    );
+    println!("  {} tokens × dim={}", n_tokens, dim);
 
     // ── Load token type IDs ───────────────────────────────────────────────────
     println!("Loading token IDs...");
@@ -127,12 +113,26 @@ fn main() -> anyhow::Result<()> {
     );
     println!("  {} docs, {} tokens total", n_docs, n_tokens);
 
+    // ── Load coarse centroids (f32 → f16) ────────────────────────────────────
+    println!("Loading coarse centroids...");
+    let (centroids_f32, n_centroids, token_dim) = read_f32_2d_npy(&args.centroids_file)?;
+    anyhow::ensure!(
+        token_dim == dim,
+        "centroids dim={} != vectors dim={}",
+        token_dim,
+        dim
+    );
+    println!("  {} centroids × dim={}", n_centroids, token_dim);
+    let centroids_f16: Vec<f16> = centroids_f32.iter().map(|&x| f16::from_f32(x)).collect();
+
+    // ── Load assignments ([N] u64 or u32) ─────────────────────────────────────
+    println!("Loading assignments...");
+    let assignments: Vec<usize> = read_assignments_npy(&args.assignments_file, n_tokens)?;
+
     // ── Build TachiomInputDataset ─────────────────────────────────────────────
-    // Use from_raw + a direct move instead of from_flat_par: PlainMultiVecQuantizer
-    // is a pass-through encoder, so no transformation is needed.
     println!("\nBuilding raw multivector dataset...");
     let encoder = PlainMultiVecQuantizer::<f16>::new(dim);
-    let mut offsets: Vec<usize> = Vec::with_capacity(doclens.len() + 1);
+    let mut offsets: Vec<usize> = Vec::with_capacity(n_docs + 1);
     offsets.push(0usize);
     for &n_tok in &doclens {
         offsets.push(offsets.last().unwrap() + n_tok * dim);
@@ -143,18 +143,18 @@ fn main() -> anyhow::Result<()> {
         offsets.last().unwrap(),
         flat_f16.len()
     );
-    let raw_dataset: TachiomInputDataset = MultiVectorDataset::from_raw(
+    let dataset: TachiomInputDataset = MultiVectorDataset::from_raw(
         flat_f16.into_boxed_slice(),
         offsets.into_boxed_slice(),
         encoder,
     );
 
-    // ── Build index ───────────────────────────────────────────────────────────
-    println!("\n=== Building Tachiom index ===");
-    let build_params = TachiomBuildParams {
+    // ── Build index from TAC output ───────────────────────────────────────────
+    println!("\n=== Building Tachiom index (from TAC output) ===");
+    let params = TachiomBuildParams {
         token_ids,
-        total_centroids: args.total_centroids,
-        tac_n_iter: args.tac_n_iter,
+        total_centroids: n_centroids, // unused by build_index_from_tac, but required by the struct
+        tac_n_iter: 0,                // unused
         pq_sample_size: args.pq_sample_size,
         pq_n_iter: args.pq_n_iter,
         normalize: args.normalize,
@@ -165,9 +165,14 @@ fn main() -> anyhow::Result<()> {
     };
 
     let build_start = Instant::now();
-    let index = Tachiom::<32>::build_index(raw_dataset, &build_params);
-    let build_time = build_start.elapsed();
-    println!("Build time: {:.2?}", build_time);
+    let index = Tachiom::<32>::build_index_from_tac(
+        centroids_f16,
+        n_centroids,
+        assignments,
+        dataset,
+        &params,
+    );
+    println!("Build time: {:.2?}", build_start.elapsed());
 
     println!("\n=== Space Usage ===");
     index.print_space_usage_bytes();
@@ -181,21 +186,18 @@ fn main() -> anyhow::Result<()> {
     println!("Saved in {:.2?}", save_start.elapsed());
 
     println!("\n=== Done — total time: {:.2?} ===", total_start.elapsed());
-
     Ok(())
 }
 
 // ============================================================================
-// I/O helpers  (mirrors bench_tac.rs / bench_encode_residuals.rs)
+// I/O helpers
 // ============================================================================
 
 fn read_f16_npy(path: &str) -> anyhow::Result<(Vec<f16>, usize)> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(File::open(path)?);
     let (shape, elem_size, _) = parse_npy_header(&mut reader)?;
     anyhow::ensure!(shape.len() == 2, "Expected 2D array for token vectors");
     anyhow::ensure!(elem_size == 2, "Expected f16 (2-byte) dtype");
-
     let (n_vecs, dim) = (shape[0], shape[1]);
     let mut raw = vec![0u8; n_vecs * dim * 2];
     reader.read_exact(&mut raw)?;
@@ -204,6 +206,14 @@ fn read_f16_npy(path: &str) -> anyhow::Result<(Vec<f16>, usize)> {
         .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     Ok((data, dim))
+}
+
+fn read_f32_2d_npy(path: &str) -> anyhow::Result<(Vec<f32>, usize, usize)> {
+    use ndarray::Array2;
+    use ndarray_npy::ReadNpyExt;
+    let arr: Array2<f32> = Array2::read_npy(BufReader::new(File::open(path)?))?;
+    let (rows, cols) = arr.dim();
+    Ok((arr.into_raw_vec_and_offset().0, rows, cols))
 }
 
 fn read_token_ids_npy(path: &str) -> anyhow::Result<Vec<usize>> {
@@ -251,6 +261,32 @@ fn read_doclens_npy(path: &str) -> anyhow::Result<Vec<usize>> {
             .chunks_exact(4)
             .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as usize)
             .collect(),
+    })
+}
+
+fn read_assignments_npy(path: &str, expected_len: usize) -> anyhow::Result<Vec<usize>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let (shape, elem_size, _) = parse_npy_header(&mut reader)?;
+    anyhow::ensure!(shape.len() == 1, "assignments must be 1D");
+    anyhow::ensure!(
+        shape[0] == expected_len,
+        "assignments length {} != n_tokens {}",
+        shape[0],
+        expected_len
+    );
+    let n = shape[0];
+    let mut raw = vec![0u8; n * elem_size];
+    reader.read_exact(&mut raw)?;
+    Ok(match elem_size {
+        8 => raw
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()) as usize)
+            .collect(),
+        4 => raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as usize)
+            .collect(),
+        _ => anyhow::bail!("unsupported assignments dtype (elem_size={})", elem_size),
     })
 }
 

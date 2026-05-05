@@ -2023,7 +2023,6 @@ checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 [[package]]
 name = "vectorium"
 version = "0.2.0"
-source = "git+ssh://git@github.com/TusKANNy/vectorium_private.git?branch=feature%2Ftachiom#bd1d4fdb312753bcc94c2ca00738169b8cd37f4d"
 dependencies = [
  "bincode 2.0.1",
  "bytemuck",
