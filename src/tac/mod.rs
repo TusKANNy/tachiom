@@ -1,15 +1,15 @@
 //! Token-Aware Clustering (TAC).
 //!
-//! TAC is a k-means variant for multivector data where each token vector carries
+//! TAC is a clustering algorithm for multivector data where each token vector carries
 //! a *token type id* (e.g. a vocabulary id from a late-interaction model such as
-//! ColBERT or SPLADE).  Rather than running one global k-means over all token
+//! ColBERT).  Rather than running one global k-means over all token
 //! vectors, TAC runs a separate k-means per token type and distributes the total
 //! centroid budget proportionally to each group's size and internal spread.
 //!
 //! # Quick start
 //!
-//! ```no_run
-//! use tachiom_private::tac::TacBuilder;
+//! ```ignore
+//! use tachiom::tac::TacBuilder;
 //!
 //! let tac = TacBuilder::new().n_iter(20).verbose(true).build();
 //! let result = tac.train(&data_f16, dim, &token_ids, total_centroids);
@@ -62,7 +62,7 @@ pub struct TacResult {
 // Builder
 // ============================================================================
 
-/// Builder for [`TokenAwareClustering`].  Mirrors the style of [`vectorium::KMeansBuilder`].
+/// Builder for [`TokenAwareClustering`].
 pub struct TacBuilder {
     n_iter: usize,
     verbose: bool,
@@ -298,9 +298,8 @@ fn train_kmeans_for_token(
     let n = indices.len();
 
     // Determine training sample size.
-    // Auto formula (mirrors the old MultivecRerank KMeans): when n > 1M, cap training at
-    //   min(10M, n, max(1M, 2·39·k, n/(2·n_iter)))
-    // so that head tokens (millions of vectors, k=4) don't dominate training time.
+    // When n > 1M, cap training at min(10M, n, max(1M, 2·39·k, n/(2·n_iter)))
+    // so that head tokens (millions of vectors, small k) don't dominate training time.
     const AUTO_THRESHOLD: usize = 1_000_000;
     const AUTO_MAX: usize = 10_000_000;
     const MIN_PTS_PER_CENTROID: usize = 39;
@@ -331,7 +330,7 @@ fn train_kmeans_for_token(
     );
 
     let centroids = if training_n < n {
-        // Use fixed seed 525 for sampling (matching old DenseDataset::sample behavior)
+        // Fixed seed for reproducible subsampling.
         let mut rng = StdRng::seed_from_u64(525);
         let local_indices: Vec<usize> = (0..n).collect();
         let sampled: Vec<usize> = local_indices
@@ -349,7 +348,7 @@ fn train_kmeans_for_token(
             training_n,
             encoder,
         );
-        // Use fixed seed 524 for k-means centroid initialization (matching old KMeans behavior)
+        // Fixed seed for reproducible centroid initialization.
         KMeansBuilder::new()
             .n_iter(n_iter)
             .n_redo(1)
@@ -358,7 +357,7 @@ fn train_kmeans_for_token(
             .build()
             .train(&training_dataset, k, None)
     } else {
-        // Use fixed seed 524 for k-means centroid initialization (matching old KMeans behavior)
+        // Fixed seed for reproducible centroid initialization.
         KMeansBuilder::new()
             .n_iter(n_iter)
             .n_redo(1)

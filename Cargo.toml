@@ -1,5 +1,5 @@
 [package]
-name = "tachiom_private"
+name = "tachiom"
 version = "0.1.0"
 edition = "2024"
 
@@ -22,12 +22,8 @@ ndarray     = "0.16"
 ndarray-npy = "0.9"
 pyo3        = { version = "0.24", features = ["extension-module"], optional = true }
 numpy       = { version = "0.24", optional = true, features = ["half"] }
-vectorium   = { git = "ssh://git@github.com/TusKANNy/vectorium_private.git", branch = "feature/tachiom" }
-kannolo     = { git = "ssh://git@github.com/TusKANNy/kannolo_private.git", branch = "tachiom" }
-
-
-[patch."ssh://git@github.com/TusKANNy/vectorium_private.git"]
-vectorium = { path = "/home/smartinico/vectorium_private" }
+vectorium   = { git = "https://github.com/TusKANNy/vectorium.git" }
+kannolo     = { git = "https://github.com/TusKANNy/kannolo.git" }
 
 [profile.release]
 opt-level = 3

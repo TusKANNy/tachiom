@@ -225,9 +225,8 @@ impl<const M: usize> Tachiom<M> {
                 }
 
                 // Score each token type: sqrt(count) * variance of (optionally normalised)
-                // residuals — matching the old train_multivec_pq behaviour.
-                // Welford single-pass variance; residuals computed on-the-fly from
-                // flat_f16 and the TAC centroids so nothing needs to be materialised.
+                // residuals. Welford single-pass variance; residuals computed on-the-fly
+                // from flat_f16 and the TAC centroids so nothing needs to be materialised.
                 let normalize = params.normalize;
                 let mut scored: Vec<(Vec<usize>, f64)> = groups
                     .into_par_iter()

@@ -3,7 +3,7 @@
 ## Installation
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" maturin develop --features python --release
+RUSTFLAGS="-C target-cpu=native" maturin develop --release
 ```
 
 ```python

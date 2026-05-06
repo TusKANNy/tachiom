@@ -7,7 +7,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use tachiom_private::tac::{TacBuilder, TacResult};
+use tachiom::tac::{TacBuilder, TacResult};
 
 #[derive(Parser, Debug)]
 #[clap(

@@ -6,9 +6,9 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::time::Instant;
 
-use tachiom_private::graph::Graph;
-use tachiom_private::hnsw::HNSWBuildConfiguration;
-use tachiom_private::tachiom::Tachiom;
+use tachiom::graph::Graph;
+use tachiom::hnsw::HNSWBuildConfiguration;
+use tachiom::tachiom::Tachiom;
 use vectorium::core::index::Index;
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
 use vectorium::vector_encoder::VectorEncoder;
@@ -17,12 +17,12 @@ use vectorium::{
     PlainDenseDataset, PlainDenseQuantizer,
 };
 
-// Blocked layout constants matching multivec_two_level_pq.rs
+// Blocked layout constants: M subspaces, KSUB centroids per subspace.
 const M: usize = 32;
 const KSUB: usize = 256;
 
 type CentroidDataset = DenseDataset<PlainDenseQuantizer<f16, DotProduct>>;
-type HNSWCentroids = tachiom_private::hnsw::HNSW<CentroidDataset, Graph>;
+type HNSWCentroids = tachiom::hnsw::HNSW<CentroidDataset, Graph>;
 
 #[derive(Parser, Debug)]
 #[clap(

@@ -4,8 +4,8 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::time::Instant;
 
-use tachiom_private::hnsw::HNSWBuildConfiguration;
-use tachiom_private::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
+use tachiom::hnsw::HNSWBuildConfiguration;
+use tachiom::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::Index;
 use vectorium::{IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
 

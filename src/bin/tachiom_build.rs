@@ -4,8 +4,8 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::time::Instant;
 
-use tachiom_private::hnsw::HNSWBuildConfiguration;
-use tachiom_private::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
+use tachiom::hnsw::HNSWBuildConfiguration;
+use tachiom::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::Index;
 use vectorium::{IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
 
@@ -128,8 +128,7 @@ fn main() -> anyhow::Result<()> {
     println!("  {} docs, {} tokens total", n_docs, n_tokens);
 
     // ── Build TachiomInputDataset ─────────────────────────────────────────────
-    // Use from_raw + a direct move instead of from_flat_par: PlainMultiVecQuantizer
-    // is a pass-through encoder, so no transformation is needed.
+    // PlainMultiVecQuantizer is a pass-through encoder; no transformation needed.
     println!("\nBuilding raw multivector dataset...");
     let encoder = PlainMultiVecQuantizer::<f16>::new(dim);
     let mut offsets: Vec<usize> = Vec::with_capacity(doclens.len() + 1);
@@ -186,7 +185,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 // ============================================================================
-// I/O helpers  (mirrors bench_tac.rs / bench_encode_residuals.rs)
+// I/O helpers
 // ============================================================================
 
 fn read_f16_npy(path: &str) -> anyhow::Result<(Vec<f16>, usize)> {

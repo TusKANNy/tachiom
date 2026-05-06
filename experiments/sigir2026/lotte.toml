@@ -15,10 +15,10 @@ build    = false
 metric   = "Success@5"
 
 [folder]
-data       = "/data2/cosimorulli/real_new_lotte/lotte_new"
-index      = "/data3/silvio/indexes/tachiom/lotte"
-experiment = "."
-qrels_path = "/data2/cosimorulli/lotte/data/lotte_pooled_qas.search.tsv"
+data       = "/path/to/lotte"                    # directory containing the .npy files
+index      = "/path/to/indexes/tachiom/lotte"    # directory where the index is saved/loaded
+experiment = "."                                 # experiment logs are written here
+qrels_path = "/path/to/lotte_pooled_qas.search.tsv"
 
 [filename]
 vectors   = "vectors.npy"        # [N, dim] f16 token vectors

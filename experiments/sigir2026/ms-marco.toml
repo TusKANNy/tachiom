@@ -15,10 +15,10 @@ build    = false
 metric   = "RR@10"
 
 [folder]
-data       = "/data1/knn_datasets/dense_datasets/msmarco_v1_passage/colbert_v2"
-index      = "/data3/silvio/indexes/tachiom"
-experiment = "."
-qrels_path = "/data1/knn_datasets/sparse_datasets/msmarco_v1_passage/qrels.dev.small.tsv"
+data       = "/path/to/msmarco/colbert_v2"        # directory containing the .npy files
+index      = "/path/to/indexes/tachiom"            # directory where the index is saved/loaded
+experiment = "."                                   # experiment logs are written here
+qrels_path = "/path/to/qrels.dev.small.tsv"
 
 [filename]
 vectors   = "vectors.npy"                    # [N, dim] f16 token vectors

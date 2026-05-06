@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{BufReader, Write};
 use std::time::Instant;
 
-use tachiom_private::tachiom::{Tachiom, TachiomInputDataset, TachiomSearchParams};
+use tachiom::tachiom::{Tachiom, TachiomInputDataset, TachiomSearchParams};
 use vectorium::core::index::Index;
 use vectorium::distances::Distance;
 use vectorium::{Dataset, IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
