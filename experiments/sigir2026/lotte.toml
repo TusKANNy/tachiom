@@ -40,6 +40,10 @@ hnsw-m          = 32
 ef-construction = 1500
 pq-subspaces    = 32
 
+# Note: TAC centroid allocation and PQ training both involve randomness (k-means
+# initialisation, training sample selection). The pq-seed above controls PQ
+# reproducibility, but results may still vary slightly across runs or machines.
+# Treat the parameters below as a starting point and adjust to your target metric.
 [query]
     [query.ef40_kc25_kd2000_a04]
     ef-search       = 40

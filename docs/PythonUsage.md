@@ -41,7 +41,7 @@ index = tachiom.Tachiom.build(
     tac_n_iter=10,               # k-means iterations inside TAC
     pq_sample_size=10_000_000,   # training vectors for the PQ encoder
     pq_n_iter=10,                # PQ k-means iterations
-    normalize=False,             # L2-normalise residuals before PQ encoding
+    normalize=True,             # L2-normalise residuals before PQ encoding
     pq_seed=42,
     hnsw_m=32,                   # HNSW neighbour count
     ef_construction=1500,        # HNSW build-time beam width
@@ -62,7 +62,7 @@ index = tachiom.Tachiom.build_from_tac(
     assignments_path,  # [N]      u32 .npy
     pq_sample_size=10_000_000,
     pq_n_iter=10,
-    normalize=False,
+    normalize=True,
     pq_seed=42,
     hnsw_m=32,
     ef_construction=1500,
@@ -89,7 +89,7 @@ scores, doc_ids = index.search(
     k_centroids=20,       # coarse centroids retrieved per query token
     k_docs_to_score=500,  # candidates passed to PQ reranking
     ef_search=30,         # HNSW beam width during coarse scoring
-    alpha=0.45,           # fraction of k-th coarse score used as pruning threshold
+    alpha=0.45,           # fraction of k-th coarse score used as candidates pruning threshold
     beta=None,            # stop PQ reranking after this many candidates scored
     lambda_=None,         # distance-adaptive HNSW early-exit factor
 )
