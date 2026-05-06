@@ -4,6 +4,7 @@
 //! single `tachiom` module with one `Tachiom` class.
 
 use crate::hnsw::HNSWBuildConfiguration;
+use crate::tac::{TacBuilder, TacResult};
 use crate::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::Index;
 use vectorium::vector_encoder::VectorEncoder;
@@ -33,6 +34,7 @@ const M_FIXED: usize = 32;
 #[pymodule]
 fn tachiom(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTachiom>()?;
+    m.add_class::<PyTac>()?;
     Ok(())
 }
 
@@ -84,8 +86,7 @@ impl PyTachiom {
         pq_subspaces: usize,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
-        let (dataset, token_ids) =
-            load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
+        let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
 
         let params = TachiomBuildParams {
             token_ids,
@@ -100,8 +101,7 @@ impl PyTachiom {
                 .with_ef_construction(ef_construction),
         };
 
-        let inner =
-            py.allow_threads(|| Tachiom::<M_FIXED>::build_index(dataset, &params));
+        let inner = py.allow_threads(|| Tachiom::<M_FIXED>::build_index(dataset, &params));
         Ok(PyTachiom { inner })
     }
 
@@ -142,8 +142,7 @@ impl PyTachiom {
         pq_subspaces: usize,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
-        let (dataset, token_ids) =
-            load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
+        let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
         let n_tokens = token_ids.len();
 
         let (centroids_f32, n_centroids, _dim) = read_f32_2d_npy(centroids_path)?;
@@ -352,10 +351,39 @@ impl PyTachiom {
         self.inner.centroids.n_elements()
     }
 
-    /// Print a per-component byte breakdown of the index (centroid HNSW,
-    /// inverted lists, offsets, residuals, total).  Mirrors the Rust CLI output.
-    fn print_space_usage_bytes(&self) {
-        self.inner.print_space_usage_bytes();
+    /// Print a per-component size breakdown of the index.
+    fn print_space_usage(&self) {
+        let (ch, il, off, res) = self.inner.space_usage_components();
+        let total = ch + il + off + res;
+        let gb = |b: usize| b as f64 / 1_073_741_824.0;
+        let pct = |b: usize| 100.0 * b as f64 / total as f64;
+        println!("Index space usage:");
+        println!(
+            "  {:<20} {:6.2} GB  ({:5.1}%)",
+            "centroids_hnsw",
+            gb(ch),
+            pct(ch)
+        );
+        println!(
+            "  {:<20} {:6.2} GB  ({:5.1}%)",
+            "inverted_lists",
+            gb(il),
+            pct(il)
+        );
+        println!(
+            "  {:<20} {:6.2} GB  ({:5.1}%)",
+            "offsets",
+            gb(off),
+            pct(off)
+        );
+        println!(
+            "  {:<20} {:6.2} GB  ({:5.1}%)",
+            "residuals",
+            gb(res),
+            pct(res)
+        );
+        println!("  {}", "─".repeat(38));
+        println!("  {:<20} {:6.2} GB", "total", gb(total));
     }
 
     fn __repr__(&self) -> String {
@@ -365,6 +393,121 @@ impl PyTachiom {
             self.dim(),
             self.n_centroids()
         )
+    }
+}
+
+// ============================================================================
+// PyTac class
+// ============================================================================
+
+#[pyclass(name = "Tac", module = "tachiom", unsendable)]
+pub struct PyTac {
+    budget: usize,
+    n_iter: usize,
+    verbose: bool,
+    max_sample_size: Option<usize>,
+    result: Option<TacResult>,
+}
+
+impl PyTac {
+    fn require_trained(&self) -> PyResult<&TacResult> {
+        self.result.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("Tac has not been trained yet; call train() first")
+        })
+    }
+}
+
+#[pymethods]
+impl PyTac {
+    #[new]
+    #[pyo3(signature = (n_centroids, *, n_iter = 10, verbose = false, max_sample_size = None))]
+    fn new(
+        n_centroids: usize,
+        n_iter: usize,
+        verbose: bool,
+        max_sample_size: Option<usize>,
+    ) -> Self {
+        PyTac {
+            budget: n_centroids,
+            n_iter,
+            verbose,
+            max_sample_size,
+            result: None,
+        }
+    }
+
+    /// Run Token-Aware Clustering on the given .npy inputs.
+    ///
+    /// May be called multiple times; each call overwrites the previous result.
+    fn train(&mut self, py: Python<'_>, vectors_path: &str, token_ids_path: &str) -> PyResult<()> {
+        let (flat_f16, dim) = read_f16_npy(vectors_path)?;
+        let token_ids = read_token_ids_npy(token_ids_path)?;
+        let n_tokens = flat_f16.len() / dim;
+        if token_ids.len() != n_tokens {
+            return Err(PyValueError::new_err(format!(
+                "token_ids length ({}) != n_tokens ({})",
+                token_ids.len(),
+                n_tokens
+            )));
+        }
+
+        let tac = TacBuilder::new()
+            .n_iter(self.n_iter)
+            .verbose(self.verbose)
+            .max_sample_size(self.max_sample_size)
+            .build();
+
+        let budget = self.budget;
+        let result = py.allow_threads(|| tac.train(&flat_f16, dim, &token_ids, budget));
+        self.result = Some(result);
+        Ok(())
+    }
+
+    // ── Properties (available after train()) ────────────────────────────────
+
+    /// Coarse centroids as f32, shape `[n_centroids, dim]`.
+    #[getter]
+    fn centroids<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray2<f32>>> {
+        let r = self.require_trained()?;
+        let f32_vec: Vec<f32> = r.centroids.iter().map(|x| x.to_f32()).collect();
+        let arr = ndarray::Array2::from_shape_vec((r.n_centroids, r.dim), f32_vec)
+            .map_err(|e| PyRuntimeError::new_err(format!("centroids reshape: {e}")))?;
+        Ok(arr.into_pyarray(py).unbind())
+    }
+
+    /// Coarse centroids as f16 (raw), shape `[n_centroids, dim]`.
+    #[getter]
+    fn centroids_f16<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray2<f16>>> {
+        let r = self.require_trained()?;
+        let arr = ndarray::Array2::from_shape_vec((r.n_centroids, r.dim), r.centroids.clone())
+            .map_err(|e| PyRuntimeError::new_err(format!("centroids_f16 reshape: {e}")))?;
+        Ok(arr.into_pyarray(py).unbind())
+    }
+
+    /// Per-token centroid assignment, shape `[n_tokens]`.
+    #[getter]
+    fn assignments<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray1<u32>>> {
+        let r = self.require_trained()?;
+        Ok(r.assignments.clone().into_pyarray(py).unbind())
+    }
+
+    /// Actual number of centroids produced (equals the budget after reconciliation).
+    #[getter]
+    fn n_centroids(&self) -> PyResult<usize> {
+        Ok(self.require_trained()?.n_centroids)
+    }
+
+    /// Token-vector dimensionality.
+    #[getter]
+    fn dim(&self) -> PyResult<usize> {
+        Ok(self.require_trained()?.dim)
+    }
+
+    fn __repr__(&self) -> String {
+        match &self.result {
+            Some(r) => format!("<Tac: n_centroids={}, dim={}>", r.n_centroids, r.dim),
+            None => format!("<Tac: budget={}, not yet trained>", self.budget),
+        }
     }
 }
 
@@ -403,9 +546,8 @@ where
             "{arg_name} must be C-contiguous; call np.ascontiguousarray({arg_name}) first"
         )));
     }
-    arr.as_slice().map_err(|_| {
-        PyValueError::new_err(format!("{arg_name} could not be exposed as a slice"))
-    })
+    arr.as_slice()
+        .map_err(|_| PyValueError::new_err(format!("{arg_name} could not be exposed as a slice")))
 }
 
 fn require_contiguous_3d<'py, 'a>(
@@ -427,9 +569,9 @@ where
             "{arg_name} must be C-contiguous; call np.ascontiguousarray({arg_name}) first"
         )));
     }
-    let slice = arr
-        .as_slice()
-        .map_err(|_| PyValueError::new_err(format!("{arg_name} could not be exposed as a slice")))?;
+    let slice = arr.as_slice().map_err(|_| {
+        PyValueError::new_err(format!("{arg_name} could not be exposed as a slice"))
+    })?;
     Ok((shape[0], shape[1], slice))
 }
 
@@ -523,9 +665,7 @@ fn read_f16_npy(path: &str) -> PyResult<(Vec<f16>, usize)> {
     let mut reader = open_buf(path)?;
     let (shape, elem_size, _) = parse_npy_header(&mut reader)?;
     if shape.len() != 2 {
-        return Err(PyValueError::new_err(
-            "Expected 2D array for token vectors",
-        ));
+        return Err(PyValueError::new_err("Expected 2D array for token vectors"));
     }
     if elem_size != 2 {
         return Err(PyValueError::new_err("Expected f16 (2-byte) dtype"));
@@ -627,7 +767,7 @@ fn read_assignments_npy(path: &str, expected_len: usize) -> PyResult<Vec<usize>>
         _ => {
             return Err(PyValueError::new_err(format!(
                 "unsupported assignments dtype (elem_size={elem_size})"
-            )))
+            )));
         }
     })
 }

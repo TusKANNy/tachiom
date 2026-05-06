@@ -13,6 +13,82 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+class Tac:
+    """Token-Aware Clustering for multivector data.
+
+    Runs a separate k-means per token type and distributes a total centroid
+    budget proportionally to each group's size and internal spread.
+
+    Usage::
+
+        tac = Tac(n_centroids=65536, n_iter=10, verbose=True)
+        tac.train("vectors.npy", "token_ids.npy")
+
+        # Feed directly into Tachiom (no temp files needed)
+        index = Tachiom.build_from_tac(
+            "vectors.npy", "token_ids.npy", "doclens.npy",
+            centroids_path=..., assignments_path=...,
+        )
+    """
+
+    def __init__(
+        self,
+        n_centroids: int,
+        *,
+        n_iter: int = 10,
+        verbose: bool = False,
+        max_sample_size: Optional[int] = None,
+    ) -> None:
+        """
+        Args:
+            n_centroids: Total centroid budget distributed across all token types.
+            n_iter: K-means iterations per token group.
+            verbose: Print progress output.
+            max_sample_size: Cap on training vectors per token group.
+                None (default) — auto formula: sample when a group exceeds 1M vectors.
+                Positive int   — hard cap regardless of group size.
+        """
+        ...
+
+    def train(self, vectors_path: str, token_ids_path: str) -> None:
+        """Run Token-Aware Clustering on the given .npy inputs.
+
+        May be called multiple times; each call overwrites the previous result.
+
+        Args:
+            vectors_path:   .npy file, [N, dim] f16 token vectors.
+            token_ids_path: .npy file, [N] i64/u32 token-type ids.
+        """
+        ...
+
+    @property
+    def centroids(self) -> NDArray[np.float32]:
+        """Coarse centroids as f32, shape [n_centroids, dim]. Available after train()."""
+        ...
+
+    @property
+    def centroids_f16(self) -> NDArray[np.float16]:
+        """Coarse centroids as f16 (raw), shape [n_centroids, dim]. Available after train()."""
+        ...
+
+    @property
+    def assignments(self) -> NDArray[np.uint32]:
+        """Per-token centroid assignment, shape [n_tokens]. Available after train()."""
+        ...
+
+    @property
+    def n_centroids(self) -> int:
+        """Actual number of centroids produced. Available after train()."""
+        ...
+
+    @property
+    def dim(self) -> int:
+        """Token-vector dimensionality. Available after train()."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+
 class Tachiom:
     """IVF-PQ index for late-interaction multivector retrieval."""
 
@@ -168,8 +244,8 @@ class Tachiom:
         """Number of coarse centroids in the IVF."""
         ...
 
-    def print_space_usage_bytes(self) -> None:
-        """Print a per-component byte breakdown of the index."""
+    def print_space_usage(self) -> None:
+        """Print a per-component size breakdown of the index in GB with percentages."""
         ...
 
     def __repr__(self) -> str: ...

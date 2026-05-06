@@ -438,6 +438,16 @@ impl<const M: usize> Tachiom<M> {
         Tachiom::from_parts(centroids_hnsw, &assignments_usize, residuals)
     }
 
+    /// Raw byte sizes for each index component: (centroids_hnsw, inverted_lists, offsets, residuals).
+    pub fn space_usage_components(&self) -> (usize, usize, usize, usize) {
+        (
+            self.centroids.space_usage_bytes(),
+            self.inverted_lists.space_usage_bytes(),
+            self.offsets.space_usage_bytes(),
+            self.residuals.space_usage_bytes(),
+        )
+    }
+
     /// Build a Tachiom index from pre-computed TAC coarse centroids and assignments.
     ///
     /// Skips Token-Aware Clustering and runs PQ training, encoding, HNSW construction,
@@ -876,15 +886,12 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
     }
 
     fn print_space_usage_bytes(&self) {
-        let centroid_hnsw_size = self.centroids.space_usage_bytes();
-        let inv_lists_size = self.inverted_lists.space_usage_bytes();
-        let offsets_size = self.offsets.space_usage_bytes();
-        let residuals_size = self.residuals.space_usage_bytes();
-        let total = centroid_hnsw_size + inv_lists_size + offsets_size + residuals_size;
+        let (ch, il, off, res) = self.space_usage_components();
+        let total = ch + il + off + res;
         println!(
-            "[Tachiom] Space: centroids_hnsw={centroid_hnsw_size}B, \
-             inverted_lists={inv_lists_size}B, offsets={offsets_size}B, \
-             residuals={residuals_size}B, total={total}B"
+            "[Tachiom] Space: centroids_hnsw={ch}B, \
+             inverted_lists={il}B, offsets={off}B, \
+             residuals={res}B, total={total}B"
         );
     }
 

@@ -21,6 +21,11 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.21",
+    "pandas",
+    "ir_measures",
+    "toml",
+    "psutil",
+    "termcolor",
 ]
 
 [tool.maturin]

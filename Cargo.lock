@@ -1226,6 +1226,7 @@ version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7cfbf3f0feededcaa4d289fe3079b03659e85c5b5a177f4ba6fb01ab4fb3e39"
 dependencies = [
+ "half",
  "libc",
  "ndarray",
  "num-complex",
@@ -1877,6 +1878,8 @@ dependencies = [
  "kannolo",
  "ndarray",
  "ndarray-npy",
+ "numpy",
+ "pyo3",
  "rand 0.8.6",
  "rayon",
  "rustc-hash",
