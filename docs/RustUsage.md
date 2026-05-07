@@ -216,6 +216,8 @@ The runner produces a `report.tsv` inside the experiment folder with one row per
 
 The TOML configs used in the paper are in `experiments/sigir2026/`.
 
+Pre-processed datasets and pre-built indexes are available on HuggingFace — see the [Datasets section in the README](../README.md#datasets) for download instructions. Update the `[folder]` paths in the TOML configs to point to your local copies before running.
+
 **Prerequisites**: single-core execution pinned via `numactl`, CPU governor set to `performance`.
 
 ```bash
@@ -261,4 +263,3 @@ Key parameters:
 | `alpha` | 0.4 |
 | Metric | Success@5 |
 
-Update the `[folder]` and `[filename]` paths in each TOML to point to your local copy of the dataset and the prebuilt index before running.

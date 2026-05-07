@@ -4,39 +4,48 @@
   <a href="https://arxiv.org/abs/2604.28142"><img src="https://badgen.net/static/arXiv/2604.28142/red" /></a>
 </p>
 
-Tachiom is a fast and scalable data structure for late-interaction multi-vector retrieval, written in Rust with Python bindings. It introduces **Token-Aware Clustering (TAC)**, which distributes the coarse-centroid budget proportionally across token types, and a hierarchical Product Quantization scheme for efficient candidate reranking.
+TACHIOM is a fast and scalable data structure for late-interaction multi-vector retrieval, written in Rust with Python bindings. It introduces **Token-Aware Clustering (TAC)**, which distributes the coarse-centroid budget proportionally across token types, and a hierarchical Product Quantization scheme for efficient candidate reranking.
 
 ## Installation
 
 ### Python
 
-Tachiom is a Rust library with Python bindings built via [maturin](https://github.com/PyO3/maturin).
+#### Quick start (prebuilt wheels)
 
-#### Prerequisites
+For most users, this is the easiest option:
 
-Install Rust via [rustup](https://rustup.rs):
+```bash
+pip install tachiom
+```
+
+If a compatible wheel exists for your platform, pip will download and install it directly without compilation. If no compatible wheel exists, pip will automatically compile from source.
+
+#### Building from source (maximum performance)
+
+For maximum performance optimized to your CPU, build from source.
+
+**Shared prerequisites** — both approaches below require Rust nightly:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Activate the nightly toolchain (required):
-
-```bash
 rustup install nightly
 rustup default nightly
 ```
 
-#### Build from source
-
-1. Clone the repository:
+**Approach 1 — compile from PyPI source:**
 
 ```bash
-git clone git@github.com:TusKANNy/tachiom.git
+RUSTFLAGS="-C target-cpu=native" pip install --no-binary :all: tachiom
+```
+
+**Approach 2 — build from GitHub (development/editable mode):**
+
+```bash
+git clone https://github.com/TusKANNy/tachiom.git
 cd tachiom
 ```
 
-2. Create a virtual environment (recommended):
+Create a virtual environment (recommended):
 
 ```bash
 python3 -m venv ./venv
@@ -50,20 +59,14 @@ conda create -n tachiom python=3.11
 conda activate tachiom
 ```
 
-3. Install maturin:
+Install maturin and build:
 
 ```bash
 pip install maturin
-```
-
-4. Build and install in editable mode:
-
-```bash
 RUSTFLAGS="-C target-cpu=native" maturin develop --release
 ```
 
-The `target-cpu=native` flag enables SIMD instructions optimized for your CPU and is strongly recommended for performance.
-
+Changes to Python code take effect immediately without reinstalling — ideal for development.
 
 ### Rust
 
@@ -103,6 +106,23 @@ scores, doc_ids = index.batch_search(queries, k=10, num_threads=0)
 ```
 
 See [docs/PythonUsage.md](docs/PythonUsage.md) for the full API, all build and search parameters, and the two-step TAC workflow.
+
+## Datasets
+
+Pre-processed datasets and pre-built indexes are available on HuggingFace, ready to use with the experiment configs in `experiments/sigir2026/`.
+
+| Dataset | HuggingFace | Index |
+|---|---|---|
+| MS MARCO-v1 (ColBERT v2) | [tuskanny/ms_marco_colbertv2](https://huggingface.co/datasets/tuskanny/ms_marco_colbertv2) | `tachiom_msmarco_4M_normalized` |
+| LoTTE Pooled (ColBERT v2) | [tuskanny/lotte_pooled_colbertv2](https://huggingface.co/datasets/tuskanny/lotte_pooled_colbertv2) | `tachiom_lotte_2M_normalized` |
+
+Each dataset contains `documents.npy`, `token_ids.npy`, `doclens.npy`, `queries.npy`, `doc_ids.npy`, `queries_ids.npy`, a qrels `.tsv` file, and a pre-built Tachiom index. Download with:
+
+```bash
+pip install huggingface_hub
+huggingface-cli download tuskanny/ms_marco_colbertv2 --repo-type dataset --local-dir ./ms_marco
+huggingface-cli download tuskanny/lotte_pooled_colbertv2 --repo-type dataset --local-dir ./lotte
+```
 
 ## Resources
 

@@ -45,8 +45,23 @@ pq-subspaces    = 32
 # reproducibility, but results may still vary slightly across runs or machines.
 # Treat the parameters below as a starting point and adjust to your target metric.
 [query]
-    [query.ef40_kc25_kd2000_a04]
+    # Success@5 = 67.5
+    [query.config_1]
+    ef-search       = 30
+    k-centroids     = 20
+    k-docs-to-score = 200
+    alpha           = 0.4
+
+    # Success@5 = 68
+    [query.config_2]
+    ef-search       = 30
+    k-centroids     = 20
+    k-docs-to-score = 300
+    alpha           = 0.4
+
+    # Success@5 = 68.5
+    [query.config_3]
     ef-search       = 40
     k-centroids     = 25
-    k-docs-to-score = 2000
+    k-docs-to-score = 500
     alpha           = 0.4
