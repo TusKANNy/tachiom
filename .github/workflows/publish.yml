@@ -1,0 +1,78 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-linux:
+    name: Build wheels on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: latest
+          rust-toolchain: nightly
+          command: build
+          args: --release -o dist -i 3.10 3.11 3.12 3.13
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux
+          path: dist/
+
+  build-macos:
+    name: Build wheels on macOS
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: latest
+          rust-toolchain: nightly
+          command: build
+          args: --release -o dist -i 3.10 3.11 3.12 3.13 --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: dist/
+
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install maturin
+      - run: maturin sdist -o dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: [build-linux, build-macos, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
