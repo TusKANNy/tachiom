@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "tachiom"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
