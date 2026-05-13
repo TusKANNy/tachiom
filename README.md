@@ -1,4 +1,7 @@
 <h1 align="center">Tachiom</h1>
+<p align="center">
+    <img width="250px" src="/imgs/tachiom_logo.png" />
+</p>
 
 <p align="center">
   <a href="https://arxiv.org/abs/2604.28142"><img src="https://badgen.net/static/arXiv/2604.28142/red" /></a>
