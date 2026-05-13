@@ -1,4 +1,4 @@
-<h1 align="center">Tachiom</h1>
+<h1 align="center">TACHIOM</h1>
 <p align="center">
     <img width="250px" src="/imgs/tachiom_logo.png" />
 </p>
