@@ -127,6 +127,38 @@ class Tachiom:
         ...
 
     @classmethod
+    def build_from_arrays(
+        cls,
+        vectors: NDArray[np.uint16],
+        token_ids: NDArray[np.uint32],
+        doclens: NDArray[np.int32],
+        *,
+        total_centroids: int = 4_194_304,
+        tac_n_iter: int = 10,
+        pq_sample_size: int = 10_000_000,
+        pq_n_iter: int = 10,
+        normalize: bool = False,
+        pq_seed: int = 42,
+        hnsw_m: int = 32,
+        ef_construction: int = 1500,
+        pq_subspaces: int = 32,
+    ) -> Tachiom:
+        """Build an index from in-memory numpy arrays (full pipeline: TAC → PQ → HNSW).
+
+        Equivalent to build() but accepts numpy arrays instead of file paths.
+        Supports memory-mapped arrays (np.load(..., mmap_mode='r')) to minimise RAM
+        usage — data is read from the buffer with a single copy into the index.
+
+        Args:
+            vectors:   [N, dim] uint16, C-contiguous.  The u16 bit patterns are
+                       reinterpreted as IEEE-754 f16 values, matching the on-disk
+                       format written by the indexing pipeline.
+            token_ids: [N] u32, vocabulary id per token.
+            doclens:   [n_docs] i32, tokens per document.
+        """
+        ...
+
+    @classmethod
     def build_from_tac(
         cls,
         vectors_path: str,
@@ -195,9 +227,11 @@ class Tachiom:
 
     def batch_search(
         self,
-        queries: NDArray[np.float32],
+        tokens: NDArray[np.float32],
+        n_queries: int,
         k: int = 10,
         *,
+        offsets: Optional[NDArray[np.uint64]] = None,
         num_threads: int = 0,
         k_centroids: int = 20,
         k_docs_to_score: int = 500,
@@ -208,17 +242,28 @@ class Tachiom:
     ) -> tuple[NDArray[np.float32], NDArray[np.uint32]]:
         """Search a batch of multivector queries.
 
+        tokens is a flat [total_tokens, dim] f32 C-contiguous array with all query
+        token vectors concatenated in query order.
+
+        Uniform mode (offsets=None): all queries have the same token count.
+            total_tokens must be divisible by n_queries.
+
+        Ragged mode (offsets provided): [n_queries + 1] u64 boundary array.
+            offsets[i]:offsets[i+1] is the row range in tokens for query i.
+            n_queries is validated against len(offsets) - 1.
+
         Args:
-            queries: 3D C-contiguous f32 array of shape (n_queries, n_tokens, dim).
+            tokens:    [total_tokens, dim] f32, C-contiguous.
+            n_queries: number of queries (always required).
+            offsets:   [n_queries + 1] u64, or None for uniform token count.
             num_threads:
                 0 — rayon's default thread pool (typically all available cores).
-                1 — serial loop (mirrors the CLI; reproducible single-thread benchmarks).
+                1 — serial loop (reproducible single-thread benchmarks).
                 n — temporary rayon pool of size n for this call.
 
         Returns:
             (scores, doc_ids) — both 2D ndarrays of shape (n_queries, k),
-            sentinel-padded when fewer than k results are produced for a
-            given query.
+            sentinel-padded when fewer than k results are produced for a given query.
         """
         ...
 

@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name            = "tachiom"
-version         = "0.1.1"
-description     = "IVF-PQ index for late-interaction multivector retrieval"
+version         = "0.2.0"
+description     = "State-of-the-art index for late-interaction multivector retrieval"
 readme          = "README.md"
 requires-python = ">=3.9"
 license         = { text = "MIT" }

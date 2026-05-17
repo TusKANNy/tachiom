@@ -14,7 +14,7 @@ use vectorium::{
 
 use half::f16;
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray2, PyReadonlyArray3, PyUntypedArrayMethods,
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -90,6 +90,66 @@ impl PyTachiom {
 
         let params = TachiomBuildParams {
             token_ids,
+            total_centroids,
+            tac_n_iter,
+            pq_sample_size,
+            pq_n_iter,
+            normalize,
+            pq_seed: Some(pq_seed),
+            hnsw_params: HNSWBuildConfiguration::default()
+                .with_num_neighbors(hnsw_m)
+                .with_ef_construction(ef_construction),
+        };
+
+        let inner = py.allow_threads(|| Tachiom::<M_FIXED>::build_index(dataset, &params));
+        Ok(PyTachiom { inner })
+    }
+
+    /// Build a Tachiom index from in-memory numpy arrays (full pipeline: TAC → PQ → HNSW).
+    ///
+    /// Equivalent to `build()` but accepts numpy arrays instead of file paths.
+    /// Supports memory-mapped arrays (`np.load(..., mmap_mode='r')`) to minimise RAM
+    /// usage during construction — data is read from the buffer with a single copy.
+    ///
+    /// `vectors` must be f16 and C-contiguous.  Cast with `.astype(np.float16)` if needed.
+    #[classmethod]
+    #[pyo3(signature = (
+        vectors,
+        token_ids,
+        doclens,
+        *,
+        total_centroids = 4_194_304,
+        tac_n_iter = 10,
+        pq_sample_size = 10_000_000,
+        pq_n_iter = 10,
+        normalize = false,
+        pq_seed = 42,
+        hnsw_m = 32,
+        ef_construction = 1500,
+        pq_subspaces = 32,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn build_from_arrays(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        vectors: PyReadonlyArray2<'_, u16>,
+        token_ids: PyReadonlyArray1<'_, u32>,
+        doclens: PyReadonlyArray1<'_, i32>,
+        total_centroids: usize,
+        tac_n_iter: usize,
+        pq_sample_size: usize,
+        pq_n_iter: usize,
+        normalize: bool,
+        pq_seed: u64,
+        hnsw_m: usize,
+        ef_construction: usize,
+        pq_subspaces: usize,
+    ) -> PyResult<Self> {
+        warn_pq_subspaces(py, pq_subspaces)?;
+        let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
+
+        let params = TachiomBuildParams {
+            token_ids: token_ids_vec,
             total_centroids,
             tac_n_iter,
             pq_sample_size,
@@ -250,17 +310,28 @@ impl PyTachiom {
 
     /// Search a batch of multivector queries.
     ///
-    /// `queries` must be a 3D C-contiguous f32 array of shape
-    /// `(n_queries, n_tokens_per_query, dim)`.  Returns `(scores, doc_ids)` as
-    /// 2D ndarrays of shape `(n_queries, k)`, sentinel-padded when fewer than
-    /// `k` results are produced for a given query.
+    /// `tokens` is a flat 2D C-contiguous f32 array of shape `(total_tokens, dim)` with
+    /// all query token vectors concatenated in query order.  `n_queries` states the number
+    /// of queries and is always required.
+    ///
+    /// **Uniform mode** (`offsets = None`): all queries are assumed to have the same token
+    /// count.  `total_tokens` must divide evenly by `n_queries`; the per-query stride is
+    /// `total_tokens / n_queries`.
+    ///
+    /// **Ragged mode** (`offsets` provided): a 1D u64 array of length `n_queries + 1`.
+    /// `offsets[i]..offsets[i+1]` is the row range in `tokens` for query `i`.
+    /// `n_queries` is validated against `len(offsets) - 1`.
+    ///
+    /// Returns `(scores, doc_ids)` — both 2D ndarrays of shape `(n_queries, k)`,
+    /// sentinel-padded when fewer than `k` results are produced for a given query.
     ///
     /// `num_threads`:
     /// - `0` — rayon's default thread pool (typically all cores).
-    /// - `1` — serial loop (mirrors the CLI; reproducible single-thread benchmarks).
+    /// - `1` — serial loop (reproducible single-thread benchmarks).
     /// - `n` — temporary rayon pool of size `n` for this call.
     #[pyo3(signature = (
-        queries, k = 10, *,
+        tokens, n_queries, k = 10, *,
+        offsets = None,
         num_threads = 0,
         k_centroids = 20,
         k_docs_to_score = 500,
@@ -273,8 +344,10 @@ impl PyTachiom {
     fn batch_search<'py>(
         &self,
         py: Python<'py>,
-        queries: PyReadonlyArray3<'py, f32>,
+        tokens: PyReadonlyArray2<'py, f32>,
+        n_queries: usize,
         k: usize,
+        offsets: Option<PyReadonlyArray1<'py, u64>>,
         num_threads: usize,
         k_centroids: usize,
         k_docs_to_score: usize,
@@ -284,16 +357,79 @@ impl PyTachiom {
         lambda_: Option<f32>,
     ) -> PyResult<(Py<PyArray2<f32>>, Py<PyArray2<u32>>)> {
         let dim = self.inner.residuals.encoder().input_dim();
-        let (n_queries, n_tokens_per_query, slice) =
-            require_contiguous_3d(&queries, dim, "queries")?;
 
-        // Build per-query views into the contiguous slice (zero-copy).
-        let stride = n_tokens_per_query * dim;
-        let mut views: Vec<DenseMultiVectorView<f32>> = Vec::with_capacity(n_queries);
-        for i in 0..n_queries {
-            let qslice = &slice[i * stride..(i + 1) * stride];
-            views.push(DenseMultiVectorView::new(qslice, dim));
+        let tokens_shape = tokens.shape();
+        if tokens_shape.len() != 2 || tokens_shape[1] != dim {
+            return Err(PyValueError::new_err(format!(
+                "tokens must have shape (total_tokens, {dim}); got {tokens_shape:?}"
+            )));
         }
+        if !tokens.is_c_contiguous() {
+            return Err(PyValueError::new_err(
+                "tokens must be C-contiguous; call np.ascontiguousarray(tokens) first",
+            ));
+        }
+        if n_queries == 0 {
+            return Err(PyValueError::new_err("n_queries must be > 0"));
+        }
+        let total_tokens = tokens_shape[0];
+        let tokens_slice = tokens
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("tokens could not be exposed as a slice"))?;
+
+        let views: Vec<DenseMultiVectorView<f32>> = match offsets {
+            None => {
+                if total_tokens % n_queries != 0 {
+                    return Err(PyValueError::new_err(format!(
+                        "total_tokens={total_tokens} is not divisible by n_queries={n_queries}; \
+                         provide an offsets array for variable-length queries"
+                    )));
+                }
+                let stride = total_tokens / n_queries * dim;
+                (0..n_queries)
+                    .map(|i| {
+                        DenseMultiVectorView::new(&tokens_slice[i * stride..(i + 1) * stride], dim)
+                    })
+                    .collect()
+            }
+            Some(off) => {
+                if !off.is_c_contiguous() {
+                    return Err(PyValueError::new_err("offsets must be C-contiguous"));
+                }
+                let off_slice = off.as_slice().map_err(|_| {
+                    PyValueError::new_err("offsets could not be exposed as a slice")
+                })?;
+                if off_slice.len() != n_queries + 1 {
+                    return Err(PyValueError::new_err(format!(
+                        "offsets length ({}) must equal n_queries + 1 ({})",
+                        off_slice.len(),
+                        n_queries + 1
+                    )));
+                }
+                if *off_slice.last().unwrap() as usize != total_tokens {
+                    return Err(PyValueError::new_err(format!(
+                        "offsets[-1]={} != total_tokens={total_tokens}",
+                        off_slice.last().unwrap()
+                    )));
+                }
+                let mut views = Vec::with_capacity(n_queries);
+                for i in 0..n_queries {
+                    let start = off_slice[i] as usize;
+                    let end = off_slice[i + 1] as usize;
+                    if start > end {
+                        return Err(PyValueError::new_err(format!(
+                            "offsets[{i}]={start} > offsets[{}]={end}: must be non-decreasing",
+                            i + 1
+                        )));
+                    }
+                    views.push(DenseMultiVectorView::new(
+                        &tokens_slice[start * dim..end * dim],
+                        dim,
+                    ));
+                }
+                views
+            }
+        };
 
         let results: Vec<Vec<(f32, u32)>> = py.allow_threads(|| {
             self.inner.batch_search(
@@ -550,31 +686,6 @@ where
         .map_err(|_| PyValueError::new_err(format!("{arg_name} could not be exposed as a slice")))
 }
 
-fn require_contiguous_3d<'py, 'a>(
-    arr: &'a PyReadonlyArray3<'py, f32>,
-    expected_dim: usize,
-    arg_name: &str,
-) -> PyResult<(usize, usize, &'a [f32])>
-where
-    'py: 'a,
-{
-    let shape = arr.shape();
-    if shape.len() != 3 || shape[2] != expected_dim {
-        return Err(PyValueError::new_err(format!(
-            "{arg_name} must have shape (n_queries, n_tokens, {expected_dim}); got {shape:?}"
-        )));
-    }
-    if !arr.is_c_contiguous() {
-        return Err(PyValueError::new_err(format!(
-            "{arg_name} must be C-contiguous; call np.ascontiguousarray({arg_name}) first"
-        )));
-    }
-    let slice = arr.as_slice().map_err(|_| {
-        PyValueError::new_err(format!("{arg_name} could not be exposed as a slice"))
-    })?;
-    Ok((shape[0], shape[1], slice))
-}
-
 /// Pad a single-query result vector to length `k` with sentinels.
 fn pad_result(result: Vec<(f32, u32)>, k: usize) -> (Vec<f32>, Vec<u32>) {
     let mut scores = Vec::with_capacity(k);
@@ -605,6 +716,86 @@ fn pad_results_batch(
         }
     }
     (scores, doc_ids)
+}
+
+// ============================================================================
+// Array-based dataset construction
+// ============================================================================
+
+/// Build a `TachiomInputDataset` directly from numpy array slices.
+///
+/// `vectors` is a `u16` array whose bit patterns are the raw IEEE-754 f16 values —
+/// the same reinterpretation that `read_f16_npy` performs when reading from disk.
+/// Works transparently with memory-mapped numpy arrays.
+fn dataset_from_arrays(
+    vectors: &PyReadonlyArray2<'_, u16>,
+    token_ids_arr: &PyReadonlyArray1<'_, u32>,
+    doclens_arr: &PyReadonlyArray1<'_, i32>,
+) -> PyResult<(TachiomInputDataset, Vec<usize>)> {
+    if !vectors.is_c_contiguous() {
+        return Err(PyValueError::new_err(
+            "vectors must be C-contiguous; call np.ascontiguousarray(vectors) first",
+        ));
+    }
+    let shape = vectors.shape();
+    if shape.len() != 2 {
+        return Err(PyValueError::new_err("vectors must be a 2D array [N, dim]"));
+    }
+    let (n_tokens, dim) = (shape[0], shape[1]);
+    let flat_f16: Vec<f16> = vectors
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("vectors could not be exposed as a slice"))?
+        .iter()
+        .map(|&bits| f16::from_bits(bits))
+        .collect();
+
+    if !token_ids_arr.is_c_contiguous() {
+        return Err(PyValueError::new_err("token_ids must be C-contiguous"));
+    }
+    let token_ids_slice = token_ids_arr
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("token_ids could not be exposed as a slice"))?;
+    if token_ids_slice.len() != n_tokens {
+        return Err(PyValueError::new_err(format!(
+            "token_ids length ({}) != n_tokens ({})",
+            token_ids_slice.len(),
+            n_tokens
+        )));
+    }
+    let token_ids: Vec<usize> = token_ids_slice.iter().map(|&x| x as usize).collect();
+
+    if !doclens_arr.is_c_contiguous() {
+        return Err(PyValueError::new_err("doclens must be C-contiguous"));
+    }
+    let doclens_slice = doclens_arr
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("doclens could not be exposed as a slice"))?;
+    for &d in doclens_slice {
+        if d < 0 {
+            return Err(PyValueError::new_err("doclens must be non-negative"));
+        }
+    }
+    let doclens: Vec<usize> = doclens_slice.iter().map(|&x| x as usize).collect();
+    let total: usize = doclens.iter().sum();
+    if total != n_tokens {
+        return Err(PyValueError::new_err(format!(
+            "sum(doclens)={total} != n_tokens={n_tokens}"
+        )));
+    }
+
+    let encoder = PlainMultiVecQuantizer::<f16>::new(dim);
+    let mut offsets: Vec<usize> = Vec::with_capacity(doclens.len() + 1);
+    offsets.push(0);
+    for &n_tok in &doclens {
+        offsets.push(offsets.last().unwrap() + n_tok * dim);
+    }
+
+    let dataset = MultiVectorDataset::from_raw(
+        flat_f16.into_boxed_slice(),
+        offsets.into_boxed_slice(),
+        encoder,
+    );
+    Ok((dataset, token_ids))
 }
 
 // ============================================================================
