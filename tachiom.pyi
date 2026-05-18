@@ -293,4 +293,15 @@ class Tachiom:
         """Print a per-component size breakdown of the index in GB with percentages."""
         ...
 
+    def get_document_embeddings(self, doc_id: int) -> NDArray[np.float32]:
+        """Reconstruct approximate token embeddings for a single document.
+
+        Returns a 2D float32 array of shape (n_tokens, dim) by decoding stored PQ
+        codes: approx = coarse_centroid + norm * PQ_residual. Result is approximate
+        due to PQ lossy compression.
+
+        Raises ValueError if doc_id is out of range.
+        """
+        ...
+
     def __repr__(self) -> str: ...

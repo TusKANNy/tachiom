@@ -7,7 +7,7 @@ use crate::hnsw::HNSWBuildConfiguration;
 use crate::tac::{TacBuilder, TacResult};
 use crate::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::Index;
-use vectorium::vector_encoder::VectorEncoder;
+use vectorium::vector_encoder::{MultiVecEncoder, VectorEncoder};
 use vectorium::{
     Dataset, DenseMultiVectorView, IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer,
 };
@@ -520,6 +520,33 @@ impl PyTachiom {
         );
         println!("  {}", "─".repeat(38));
         println!("  {:<20} {:6.2} GB", "total", gb(total));
+    }
+
+    /// Reconstruct approximate token embeddings for a single document.
+    ///
+    /// Returns a 2D f32 array of shape `(n_tokens, dim)` obtained by decoding the
+    /// stored PQ codes: `approx = coarse_centroid + norm * PQ_residual`.
+    /// The result is approximate due to PQ lossy compression.
+    ///
+    /// Raises `ValueError` if `doc_id` is out of range.
+    fn get_document_embeddings<'py>(
+        &self,
+        py: Python<'py>,
+        doc_id: u32,
+    ) -> PyResult<Py<PyArray2<f32>>> {
+        let n_docs = self.inner.residuals.len();
+        if doc_id as usize >= n_docs {
+            return Err(PyValueError::new_err(format!(
+                "doc_id {doc_id} is out of range (index has {n_docs} documents)"
+            )));
+        }
+        let encoded = self.inner.residuals.get(doc_id as u64);
+        let decoded = self.inner.residuals.encoder().decode_vector(encoded);
+        let n_tokens = decoded.num_vecs();
+        let dim = decoded.dim();
+        let array = ndarray::Array2::from_shape_vec((n_tokens, dim), decoded.values().to_vec())
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(array.into_pyarray(py).unbind())
     }
 
     fn __repr__(&self) -> String {
