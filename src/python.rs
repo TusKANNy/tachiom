@@ -18,14 +18,163 @@ use numpy::{
 };
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyDict, PyType};
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 
 /// PQ subspace count.  Hard-coded to match the rest of the codebase; the public
 /// `pq_subspaces` kwarg is validated against this value (warns if different).
 const M_FIXED: usize = 32;
+
+/// Minimum points per centroid — mirrors the TAC allocation strategy constant.
+const MIN_PTS_PER_CENTROID: usize = 39;
+/// Safety factor applied to the minimum TAC budget when computing the floor.
+const TAC_FLOOR_FACTOR: f64 = 1.1;
+
+// ============================================================================
+// Auto build-param heuristic
+// ============================================================================
+
+/// Resolved TAC build parameters, returned by [`resolve_tac_params`].
+struct ResolvedTacParams {
+    total_centroids: usize,
+    micro_threshold: usize,
+    small_threshold: usize,
+    /// Saturation cap: adding more centroids beyond this is pointless.
+    sat_cap: usize,
+    /// Raw power-of-2 formula value, before floor / cap.
+    formula: usize,
+    /// True when an explicit `total_centroids` value was capped to `sat_cap`.
+    was_capped: bool,
+}
+
+/// Compute recommended TAC build parameters from the token-ID distribution.
+///
+/// All `_override` arguments mirror the user-facing kwargs: `None` → auto-compute.
+fn resolve_tac_params(
+    token_ids: &[u32],
+    total_centroids_override: Option<usize>,
+    micro_override: Option<usize>,
+    small_override: Option<usize>,
+) -> ResolvedTacParams {
+    let n_tokens = token_ids.len().max(128);
+
+    // Nearest power-of-2 to n_tokens / 128.
+    let exp = (n_tokens as f64 / 128.0).log2().round() as u32;
+    let formula = 1usize << exp;
+
+    // Thresholds: nearest power-of-2 to n_tokens^(1/4), clamped to [32, 128].
+    let micro_exp = (n_tokens as f64).powf(0.25).log2().round() as u32;
+    let micro_auto = (1usize << micro_exp).clamp(32, 128);
+    let small_auto = micro_auto * 2;
+    let micro = micro_override.unwrap_or(micro_auto);
+    let small = small_override.unwrap_or(small_auto);
+
+    // Token-type frequency histogram.
+    let mut freq: HashMap<u32, usize> = HashMap::new();
+    for &id in token_ids {
+        *freq.entry(id).or_insert(0) += 1;
+    }
+
+    let mut n_micro_t: usize = 0;
+    let mut n_small_t: usize = 0;
+    let mut n_active_t: usize = 0;
+    let mut total_active_tokens: usize = 0;
+    for &c in freq.values() {
+        if c < micro {
+            n_micro_t += 1;
+        } else if c < small {
+            n_small_t += 1;
+        } else {
+            n_active_t += 1;
+            total_active_tokens += c;
+        }
+    }
+
+    let min_budget = n_micro_t + n_small_t * 2 + n_active_t * 4;
+    let sat_cap = n_micro_t + n_small_t * 2 + total_active_tokens / MIN_PTS_PER_CENTROID;
+
+    // TAC floor: enough to run TAC with buffer, but never above sat_cap.
+    let tac_floor = ((min_budget as f64 * TAC_FLOOR_FACTOR).ceil() as usize).min(sat_cap);
+
+    let (total_centroids, was_capped) = match total_centroids_override {
+        Some(tc) if tc > sat_cap => (sat_cap, true),
+        Some(tc) => (tc, false),
+        None => (formula.max(tac_floor), false),
+    };
+
+    ResolvedTacParams {
+        total_centroids,
+        micro_threshold: micro,
+        small_threshold: small,
+        sat_cap,
+        formula,
+        was_capped,
+    }
+}
+
+// ============================================================================
+// Python-exposed auto_build_params function
+// ============================================================================
+
+/// Compute recommended TAC build parameters from a flat token-ID array.
+///
+/// Returns a dict with keys ``total_centroids``, ``tac_micro_threshold``,
+/// ``tac_small_threshold``, ``sat_cap``, and ``formula``.
+///
+/// Any kwarg set to a non-``None`` value overrides the heuristic for that
+/// parameter; ``None`` (default) triggers full auto-computation.
+///
+/// A ``UserWarning`` is emitted when an explicit ``total_centroids`` exceeds
+/// the saturation cap.
+#[pyfunction]
+#[pyo3(signature = (
+    token_ids,
+    *,
+    total_centroids = None,
+    tac_micro_threshold = None,
+    tac_small_threshold = None,
+))]
+fn auto_build_params(
+    py: Python<'_>,
+    token_ids: PyReadonlyArray1<'_, u32>,
+    total_centroids: Option<usize>,
+    tac_micro_threshold: Option<usize>,
+    tac_small_threshold: Option<usize>,
+) -> PyResult<Py<PyDict>> {
+    let ids = token_ids
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))?;
+
+    let p = resolve_tac_params(
+        ids,
+        total_centroids,
+        tac_micro_threshold,
+        tac_small_threshold,
+    );
+
+    if p.was_capped {
+        let msg = format!(
+            "total_centroids={} exceeds the saturation point ({}). \
+             Capping to {}. Extra centroids beyond this point would be empty.",
+            total_centroids.unwrap(),
+            p.sat_cap,
+            p.sat_cap,
+        );
+        let warnings = py.import("warnings")?;
+        warnings.call_method1("warn", (msg,))?;
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("total_centroids", p.total_centroids)?;
+    dict.set_item("tac_micro_threshold", p.micro_threshold)?;
+    dict.set_item("tac_small_threshold", p.small_threshold)?;
+    dict.set_item("sat_cap", p.sat_cap)?;
+    dict.set_item("formula", p.formula)?;
+    Ok(dict.into())
+}
 
 // ============================================================================
 // Module
@@ -35,6 +184,7 @@ const M_FIXED: usize = 32;
 fn tachiom(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTachiom>()?;
     m.add_class::<PyTac>()?;
+    m.add_function(wrap_pyfunction!(auto_build_params, m)?)?;
     Ok(())
 }
 
@@ -58,13 +208,13 @@ impl PyTachiom {
         token_ids_path,
         doclens_path,
         *,
-        total_centroids = 4_194_304,
+        total_centroids = None,
         tac_n_iter = 10,
         tac_micro_threshold = None,
         tac_small_threshold = None,
         pq_sample_size = 10_000_000,
         pq_n_iter = 10,
-        normalize = false,
+        normalize = true,
         pq_seed = 42,
         hnsw_m = 32,
         ef_construction = 1500,
@@ -77,7 +227,7 @@ impl PyTachiom {
         vectors_path: &str,
         token_ids_path: &str,
         doclens_path: &str,
-        total_centroids: usize,
+        total_centroids: Option<usize>,
         tac_n_iter: usize,
         tac_micro_threshold: Option<usize>,
         tac_small_threshold: Option<usize>,
@@ -92,12 +242,23 @@ impl PyTachiom {
         warn_pq_subspaces(py, pq_subspaces)?;
         let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
 
-        let params = TachiomBuildParams {
-            token_ids,
+        let token_ids_u32: Vec<u32> = token_ids.iter().map(|&x| x as u32).collect();
+        let resolved = resolve_tac_params(
+            &token_ids_u32,
             total_centroids,
-            tac_n_iter,
             tac_micro_threshold,
             tac_small_threshold,
+        );
+        if resolved.was_capped {
+            warn_saturation_cap(py, total_centroids.unwrap(), resolved.sat_cap)?;
+        }
+
+        let params = TachiomBuildParams {
+            token_ids,
+            total_centroids: resolved.total_centroids,
+            tac_n_iter,
+            tac_micro_threshold: Some(resolved.micro_threshold),
+            tac_small_threshold: Some(resolved.small_threshold),
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -124,13 +285,13 @@ impl PyTachiom {
         token_ids,
         doclens,
         *,
-        total_centroids = 4_194_304,
+        total_centroids = None,
         tac_n_iter = 10,
         tac_micro_threshold = None,
         tac_small_threshold = None,
         pq_sample_size = 10_000_000,
         pq_n_iter = 10,
-        normalize = false,
+        normalize = true,
         pq_seed = 42,
         hnsw_m = 32,
         ef_construction = 1500,
@@ -143,7 +304,7 @@ impl PyTachiom {
         vectors: PyReadonlyArray2<'_, u16>,
         token_ids: PyReadonlyArray1<'_, u32>,
         doclens: PyReadonlyArray1<'_, i32>,
-        total_centroids: usize,
+        total_centroids: Option<usize>,
         tac_n_iter: usize,
         tac_micro_threshold: Option<usize>,
         tac_small_threshold: Option<usize>,
@@ -158,12 +319,25 @@ impl PyTachiom {
         warn_pq_subspaces(py, pq_subspaces)?;
         let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
 
-        let params = TachiomBuildParams {
-            token_ids: token_ids_vec,
+        let ids_u32 = token_ids
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))?;
+        let resolved = resolve_tac_params(
+            ids_u32,
             total_centroids,
-            tac_n_iter,
             tac_micro_threshold,
             tac_small_threshold,
+        );
+        if resolved.was_capped {
+            warn_saturation_cap(py, total_centroids.unwrap(), resolved.sat_cap)?;
+        }
+
+        let params = TachiomBuildParams {
+            token_ids: token_ids_vec,
+            total_centroids: resolved.total_centroids,
+            tac_n_iter,
+            tac_micro_threshold: Some(resolved.micro_threshold),
+            tac_small_threshold: Some(resolved.small_threshold),
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -703,6 +877,16 @@ impl PyTac {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+fn warn_saturation_cap(py: Python<'_>, requested: usize, sat_cap: usize) -> PyResult<()> {
+    let msg = format!(
+        "total_centroids={requested} exceeds the saturation point ({sat_cap}). \
+         Capping to {sat_cap}. Extra centroids beyond this point would be empty."
+    );
+    let warnings = py.import("warnings")?;
+    warnings.call_method1("warn", (msg,))?;
+    Ok(())
+}
 
 fn warn_pq_subspaces(py: Python<'_>, pq_subspaces: usize) -> PyResult<()> {
     if pq_subspaces != M_FIXED {
