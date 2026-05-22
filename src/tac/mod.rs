@@ -36,6 +36,13 @@ pub use strategies::allocate_centroids_damped_spread;
 pub use strategies::compute_spread_measure;
 
 // ============================================================================
+// Default thresholds for token group classification
+// ============================================================================
+
+const DEFAULT_MICRO_THRESHOLD: usize = 128;
+const DEFAULT_SMALL_THRESHOLD: usize = 256;
+
+// ============================================================================
 // Output
 // ============================================================================
 
@@ -71,6 +78,8 @@ pub struct TacBuilder {
     /// `Some(usize::MAX)` = never sample, always use the full group.
     /// `Some(n)` = use at most `n` vectors for training.
     max_sample_size: Option<usize>,
+    micro_threshold: Option<usize>,
+    small_threshold: Option<usize>,
 }
 
 impl Default for TacBuilder {
@@ -79,6 +88,8 @@ impl Default for TacBuilder {
             n_iter: 10,
             verbose: false,
             max_sample_size: None,
+            micro_threshold: None,
+            small_threshold: None,
         }
     }
 }
@@ -112,11 +123,27 @@ impl TacBuilder {
         self
     }
 
+    /// Override the micro threshold (default: 128).
+    /// Token groups with fewer than this many vectors receive 1 centroid each.
+    pub fn micro_threshold(mut self, micro_threshold: usize) -> Self {
+        self.micro_threshold = Some(micro_threshold);
+        self
+    }
+
+    /// Override the small threshold (default: 256).
+    /// Token groups in `[micro_threshold, small_threshold)` receive 2 centroids each.
+    pub fn small_threshold(mut self, small_threshold: usize) -> Self {
+        self.small_threshold = Some(small_threshold);
+        self
+    }
+
     pub fn build(self) -> TokenAwareClustering {
         TokenAwareClustering {
             n_iter: self.n_iter,
             verbose: self.verbose,
             max_sample_size: self.max_sample_size,
+            micro_threshold: self.micro_threshold,
+            small_threshold: self.small_threshold,
         }
     }
 }
@@ -132,6 +159,8 @@ pub struct TokenAwareClustering {
     n_iter: usize,
     verbose: bool,
     max_sample_size: Option<usize>,
+    micro_threshold: Option<usize>,
+    small_threshold: Option<usize>,
 }
 
 impl Default for TokenAwareClustering {
@@ -171,6 +200,17 @@ impl TokenAwareClustering {
             n_vectors
         );
 
+        let total_centroids = if total_centroids > n_vectors {
+            eprintln!(
+                "[TAC] Warning: total_centroids ({}) > n_vectors ({}); \
+                 capping to n_vectors to avoid k-means crash.",
+                total_centroids, n_vectors
+            );
+            n_vectors
+        } else {
+            total_centroids
+        };
+
         let train_start = Instant::now();
 
         // ── Group vector indices by token id ──────────────────────────────────
@@ -189,12 +229,61 @@ impl TokenAwareClustering {
             );
         }
 
+        // ── Minimum budget check ──────────────────────────────────────────────
+        // TAC needs at minimum 1 centroid per micro type (< micro_threshold vecs),
+        // 2 per small type (micro_threshold..small_threshold vecs), and 4 per active type (≥ small_threshold vecs).
+        // If the budget cannot cover even these floors, TAC produces meaningless
+        // per-type clusters and panics during assignment lookup.
+        // Fall back to a single global k-means on all vectors instead.
+        let micro_threshold = self.micro_threshold.unwrap_or(DEFAULT_MICRO_THRESHOLD);
+        let small_threshold = self.small_threshold.unwrap_or(DEFAULT_SMALL_THRESHOLD);
+        let n_micro = token_groups
+            .values()
+            .filter(|v| v.len() < micro_threshold)
+            .count();
+        let n_small = token_groups
+            .values()
+            .filter(|v| v.len() >= micro_threshold && v.len() < small_threshold)
+            .count();
+        let n_active = token_groups
+            .values()
+            .filter(|v| v.len() >= small_threshold)
+            .count();
+        let min_tac_budget = n_micro + n_small * 2 + n_active * 4;
+
+        if total_centroids < min_tac_budget {
+            eprintln!(
+                "[TAC] Warning: total_centroids ({}) < minimum TAC budget \
+                 ({} = {}×1 + {}×2 + {}×4). \
+                 TAC is designed for large-scale datasets; falling back to \
+                 global k-means.",
+                total_centroids, min_tac_budget, n_micro, n_small, n_active
+            );
+            let all_indices: Vec<usize> = (0..n_vectors).collect();
+            let (centroids, assignments) = train_kmeans_for_token(
+                data,
+                &all_indices,
+                dim,
+                total_centroids,
+                self.n_iter,
+                self.max_sample_size,
+            );
+            return TacResult {
+                centroids: centroids.values().to_vec(),
+                assignments,
+                dim,
+                n_centroids: total_centroids,
+            };
+        }
+
         // ── Centroid budget allocation ─────────────────────────────────────────
         let allocation = allocate_centroids_damped_spread(
             &token_groups,
             data,
             dim,
             total_centroids,
+            micro_threshold,
+            small_threshold,
             self.verbose,
         );
 

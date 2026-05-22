@@ -60,6 +60,8 @@ impl PyTachiom {
         *,
         total_centroids = 4_194_304,
         tac_n_iter = 10,
+        tac_micro_threshold = None,
+        tac_small_threshold = None,
         pq_sample_size = 10_000_000,
         pq_n_iter = 10,
         normalize = false,
@@ -77,6 +79,8 @@ impl PyTachiom {
         doclens_path: &str,
         total_centroids: usize,
         tac_n_iter: usize,
+        tac_micro_threshold: Option<usize>,
+        tac_small_threshold: Option<usize>,
         pq_sample_size: usize,
         pq_n_iter: usize,
         normalize: bool,
@@ -92,6 +96,8 @@ impl PyTachiom {
             token_ids,
             total_centroids,
             tac_n_iter,
+            tac_micro_threshold,
+            tac_small_threshold,
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -120,6 +126,8 @@ impl PyTachiom {
         *,
         total_centroids = 4_194_304,
         tac_n_iter = 10,
+        tac_micro_threshold = None,
+        tac_small_threshold = None,
         pq_sample_size = 10_000_000,
         pq_n_iter = 10,
         normalize = false,
@@ -137,6 +145,8 @@ impl PyTachiom {
         doclens: PyReadonlyArray1<'_, i32>,
         total_centroids: usize,
         tac_n_iter: usize,
+        tac_micro_threshold: Option<usize>,
+        tac_small_threshold: Option<usize>,
         pq_sample_size: usize,
         pq_n_iter: usize,
         normalize: bool,
@@ -152,6 +162,8 @@ impl PyTachiom {
             token_ids: token_ids_vec,
             total_centroids,
             tac_n_iter,
+            tac_micro_threshold,
+            tac_small_threshold,
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -214,6 +226,8 @@ impl PyTachiom {
             token_ids,
             total_centroids: n_centroids, // unused by build_index_from_tac, required by struct
             tac_n_iter: 0,                // unused
+            tac_micro_threshold: None,    // unused
+            tac_small_threshold: None,    // unused
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -569,6 +583,8 @@ pub struct PyTac {
     n_iter: usize,
     verbose: bool,
     max_sample_size: Option<usize>,
+    micro_threshold: Option<usize>,
+    small_threshold: Option<usize>,
     result: Option<TacResult>,
 }
 
@@ -583,18 +599,22 @@ impl PyTac {
 #[pymethods]
 impl PyTac {
     #[new]
-    #[pyo3(signature = (n_centroids, *, n_iter = 10, verbose = false, max_sample_size = None))]
+    #[pyo3(signature = (n_centroids, *, n_iter = 10, verbose = false, max_sample_size = None, micro_threshold = None, small_threshold = None))]
     fn new(
         n_centroids: usize,
         n_iter: usize,
         verbose: bool,
         max_sample_size: Option<usize>,
+        micro_threshold: Option<usize>,
+        small_threshold: Option<usize>,
     ) -> Self {
         PyTac {
             budget: n_centroids,
             n_iter,
             verbose,
             max_sample_size,
+            micro_threshold,
+            small_threshold,
             result: None,
         }
     }
@@ -614,11 +634,17 @@ impl PyTac {
             )));
         }
 
-        let tac = TacBuilder::new()
+        let mut tac_builder = TacBuilder::new()
             .n_iter(self.n_iter)
             .verbose(self.verbose)
-            .max_sample_size(self.max_sample_size)
-            .build();
+            .max_sample_size(self.max_sample_size);
+        if let Some(v) = self.micro_threshold {
+            tac_builder = tac_builder.micro_threshold(v);
+        }
+        if let Some(v) = self.small_threshold {
+            tac_builder = tac_builder.small_threshold(v);
+        }
+        let tac = tac_builder.build();
 
         let budget = self.budget;
         let result = py.allow_threads(|| tac.train(&flat_f16, dim, &token_ids, budget));

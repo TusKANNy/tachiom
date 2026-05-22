@@ -794,6 +794,12 @@ pub struct TachiomBuildParams {
     /// K-means iterations per token type inside TAC (default: 10).
     pub tac_n_iter: usize,
 
+    /// Token groups smaller than this receive 1 centroid each (`None` = use TAC default of 128).
+    pub tac_micro_threshold: Option<usize>,
+
+    /// Token groups in [micro, small) receive 2 centroids each (`None` = use TAC default of 256).
+    pub tac_small_threshold: Option<usize>,
+
     /// Number of tokens sampled for PQ training.
     pub pq_sample_size: usize,
 
@@ -816,6 +822,8 @@ impl Default for TachiomBuildParams {
             token_ids: Vec::new(),
             total_centroids: 4_194_304,
             tac_n_iter: 10,
+            tac_micro_threshold: None,
+            tac_small_threshold: None,
             pq_sample_size: 10_000_000,
             pq_n_iter: 10,
             normalize: false,
@@ -931,7 +939,14 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             n_tokens
         );
         println!("[Tachiom::build_index] Step 1: Token-Aware Clustering...");
-        let tac = TacBuilder::new().n_iter(params.tac_n_iter).build();
+        let mut tac_builder = TacBuilder::new().n_iter(params.tac_n_iter);
+        if let Some(v) = params.tac_micro_threshold {
+            tac_builder = tac_builder.micro_threshold(v);
+        }
+        if let Some(v) = params.tac_small_threshold {
+            tac_builder = tac_builder.small_threshold(v);
+        }
+        let tac = tac_builder.build();
         let tac_result = tac.train(
             flat_f16,
             token_dim,

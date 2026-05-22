@@ -40,6 +40,14 @@ struct Args {
     #[clap(long, default_value_t = 10)]
     tac_n_iter: usize,
 
+    /// TAC micro threshold: token groups smaller than this get 1 centroid each
+    #[clap(long, default_value_t = 128)]
+    tac_micro_threshold: usize,
+
+    /// TAC small threshold: token groups in [micro, small) get 2 centroids each
+    #[clap(long, default_value_t = 256)]
+    tac_small_threshold: usize,
+
     /// Tokens sampled for PQ training
     #[clap(long, default_value_t = 10_000_000)]
     pq_sample_size: usize,
@@ -154,6 +162,8 @@ fn main() -> anyhow::Result<()> {
         token_ids,
         total_centroids: args.total_centroids,
         tac_n_iter: args.tac_n_iter,
+        tac_micro_threshold: Some(args.tac_micro_threshold),
+        tac_small_threshold: Some(args.tac_small_threshold),
         pq_sample_size: args.pq_sample_size,
         pq_n_iter: args.pq_n_iter,
         normalize: args.normalize,

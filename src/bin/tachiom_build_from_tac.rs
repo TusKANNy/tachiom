@@ -154,7 +154,9 @@ fn main() -> anyhow::Result<()> {
     let params = TachiomBuildParams {
         token_ids,
         total_centroids: n_centroids, // unused by build_index_from_tac, but required by the struct
-        tac_n_iter: 0,                // unused
+        tac_n_iter: 0,                // unused (TAC already run externally)
+        tac_micro_threshold: None,
+        tac_small_threshold: None,
         pq_sample_size: args.pq_sample_size,
         pq_n_iter: args.pq_n_iter,
         normalize: args.normalize,

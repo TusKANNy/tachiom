@@ -116,10 +116,10 @@ pub fn allocate_centroids_damped_spread(
     data: &[f16],
     dim: usize,
     total_centroids: usize,
+    micro_threshold: usize,
+    small_threshold: usize,
     verbose: bool,
 ) -> HashMap<usize, usize> {
-    const MICRO_THRESHOLD: usize = 128;
-    const SMALL_THRESHOLD: usize = 256;
     const HARD_FLOOR: usize = 4;
     const MIN_POINTS_PER_CENTROID: usize = 39;
 
@@ -130,7 +130,7 @@ pub fn allocate_centroids_damped_spread(
     println!("Budget: {} centroids", total_centroids);
     println!(
         "Thresholds: Micro < {}, Small < {}",
-        MICRO_THRESHOLD, SMALL_THRESHOLD
+        micro_threshold, small_threshold
     );
     println!(
         "Bounds: Floor = {}, Min points/centroid = {}",
@@ -146,8 +146,8 @@ pub fn allocate_centroids_damped_spread(
 
     for (&token_id, indices) in token_groups {
         match indices.len() {
-            n if n < MICRO_THRESHOLD => micro_tokens.push(token_id),
-            n if n < SMALL_THRESHOLD => small_tokens.push(token_id),
+            n if n < micro_threshold => micro_tokens.push(token_id),
+            n if n < small_threshold => small_tokens.push(token_id),
             n => active_tokens.push((token_id, n)),
         }
     }
@@ -158,20 +158,20 @@ pub fn allocate_centroids_damped_spread(
 
     println!(
         "Micro tokens (< {}): {} tokens → {} centroids",
-        MICRO_THRESHOLD,
+        micro_threshold,
         micro_tokens.len(),
         micro_budget
     );
     println!(
         "Small tokens ({}-{}): {} tokens → {} centroids",
-        MICRO_THRESHOLD,
-        SMALL_THRESHOLD,
+        micro_threshold,
+        small_threshold,
         small_tokens.len(),
         small_budget
     );
     println!(
         "Active tokens (≥ {}): {} tokens",
-        SMALL_THRESHOLD,
+        small_threshold,
         active_tokens.len()
     );
     println!("Tail budget used: {}", tail_budget);
