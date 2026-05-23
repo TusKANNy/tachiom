@@ -23,6 +23,12 @@ pip install tachiom
 
 If a compatible wheel exists for your platform, pip will download and install it directly without compilation. If no compatible wheel exists, pip will automatically compile from source.
 
+This installs the core library with its only required dependency (`numpy`). If you also need the benchmarking / experiment scripts (`scripts/run_experiments.py`, analysis notebooks), install the optional extras:
+
+```bash
+pip install tachiom[scripts]
+```
+
 #### Building from source (maximum performance)
 
 For maximum performance optimized to your CPU, build from source.
@@ -73,11 +79,20 @@ Changes to Python code take effect immediately without reinstalling — ideal fo
 
 ### Rust
 
-To compile all the Rust binaries in `src/bin/`:
+The crate has two feature flags:
+
+| Feature | What it enables |
+|---|---|
+| `python` | PyO3 bindings — used automatically by maturin |
+| `cli` | CLI binaries in `src/bin/` (`tachiom_build`, `tachiom_search`, `bench_tac`, …) |
+
+Neither feature is active by default, so a plain `cargo build --release` compiles only the library crate. To build the CLI binaries, enable the `cli` feature:
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo build --release
+RUSTFLAGS="-C target-cpu=native" cargo build --release --features cli
 ```
+
+The resulting binaries are placed in `target/release/`.
 
 Details on how to use Tachiom's Rust CLI can be found in [docs/RustUsage.md](docs/RustUsage.md).
 
@@ -96,7 +111,6 @@ index = tachiom.Tachiom.build(
     "vectors.npy",
     "token_ids.npy",
     "doclens.npy",
-    total_centroids=2_097_152,
 )
 index.save("my_index.bin")
 

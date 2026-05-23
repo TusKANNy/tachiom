@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name            = "tachiom"
-version         = "0.2.4"
+version         = "0.2.5"
 description     = "State-of-the-art index for late-interaction multivector retrieval"
 readme          = "README.md"
 requires-python = ">=3.9"
@@ -21,6 +21,12 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+# Only needed for scripts/run_experiments.py and benchmarking notebooks.
+# Install with: pip install tachiom[scripts]
+scripts = [
     "pandas",
     "ir_measures",
     "toml",
