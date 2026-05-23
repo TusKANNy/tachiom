@@ -21,7 +21,7 @@ class Tac:
 
     Usage::
 
-        tac = Tac(n_centroids=65536, n_iter=10, verbose=True)
+        tac = Tac(verbose=True)  # all params auto-computed from data
         tac.train("vectors.npy", "token_ids.npy")
 
         # Feed directly into Tachiom (no temp files needed)
@@ -33,20 +33,29 @@ class Tac:
 
     def __init__(
         self,
-        n_centroids: int,
+        n_centroids: int | None = None,
         *,
-        n_iter: int = 10,
+        n_iter: int | None = None,
         verbose: bool = False,
         max_sample_size: Optional[int] = None,
+        micro_threshold: Optional[int] = None,
+        small_threshold: Optional[int] = None,
     ) -> None:
         """
+        All keyword arguments default to None — resolved at train() time:
+            n_centroids:     auto (2^round(log2(n_tokens/128)), floored to TAC minimum)
+            n_iter:          10
+            micro_threshold: auto (2^round(log2(n_tokens^0.25)) clamped to [32, 128])
+            small_threshold: auto (2 × micro_threshold)
+            max_sample_size: None — use all vectors per token group
+
         Args:
             n_centroids: Total centroid budget distributed across all token types.
             n_iter: K-means iterations per token group.
             verbose: Print progress output.
             max_sample_size: Cap on training vectors per token group.
-                None (default) — auto formula: sample when a group exceeds 1M vectors.
-                Positive int   — hard cap regardless of group size.
+            micro_threshold: Token groups with fewer occurrences get 1 centroid.
+            small_threshold: Token groups in [micro, small) get 2 centroids.
         """
         ...
 
@@ -101,28 +110,32 @@ class Tachiom:
         token_ids_path: str,
         doclens_path: str,
         *,
-        total_centroids: int = 4_194_304,
-        tac_n_iter: int = 10,
-        pq_sample_size: int = 10_000_000,
-        pq_n_iter: int = 10,
-        normalize: bool = False,
-        pq_seed: int = 42,
-        hnsw_m: int = 32,
-        ef_construction: int = 1500,
+        total_centroids: int | None = None,
+        tac_n_iter: int | None = None,
+        tac_micro_threshold: int | None = None,
+        tac_small_threshold: int | None = None,
+        pq_sample_size: int | None = None,
+        pq_n_iter: int | None = None,
+        normalize: bool | None = None,
+        pq_seed: int | None = None,
+        hnsw_m: int | None = None,
+        ef_construction: int | None = None,
         pq_subspaces: int = 32,
     ) -> Tachiom:
         """Build an index from .npy inputs (full pipeline: TAC → PQ → HNSW).
 
-        Args:
-            vectors_path:  .npy file, [N, dim] f16 token vectors.
-            token_ids_path: .npy file, [N] i64/u32 token-type ids.
-            doclens_path:   .npy file, [n_docs] i32/i64 document lengths.
-            total_centroids: TAC coarse-centroid budget.
-            normalize: if True, residuals are L2-normalised before PQ encoding
-                       (per-token norms are embedded in the encoded payload).
-            pq_subspaces: number of PQ subspaces.  Only 32 is currently
-                          supported; other values trigger a warning and the
-                          build proceeds with M=32.
+        All keyword arguments default to None, which selects the built-in default:
+            total_centroids:     auto (2^round(log2(n_tokens/128)), floored to TAC minimum)
+            tac_n_iter:          10
+            tac_micro_threshold: auto (2^round(log2(n_tokens^0.25)) clamped to [32, 128])
+            tac_small_threshold: auto (2 × tac_micro_threshold)
+            pq_sample_size:      10_000_000
+            pq_n_iter:           10
+            normalize:           True (L2-normalise residuals before PQ encoding)
+            pq_seed:             42
+            hnsw_m:              32
+            ef_construction:     1500
+            pq_subspaces:        32 (only supported value; others fall back to 32)
         """
         ...
 
@@ -133,14 +146,16 @@ class Tachiom:
         token_ids: NDArray[np.uint32],
         doclens: NDArray[np.int32],
         *,
-        total_centroids: int = 4_194_304,
-        tac_n_iter: int = 10,
-        pq_sample_size: int = 10_000_000,
-        pq_n_iter: int = 10,
-        normalize: bool = False,
-        pq_seed: int = 42,
-        hnsw_m: int = 32,
-        ef_construction: int = 1500,
+        total_centroids: int | None = None,
+        tac_n_iter: int | None = None,
+        tac_micro_threshold: int | None = None,
+        tac_small_threshold: int | None = None,
+        pq_sample_size: int | None = None,
+        pq_n_iter: int | None = None,
+        normalize: bool | None = None,
+        pq_seed: int | None = None,
+        hnsw_m: int | None = None,
+        ef_construction: int | None = None,
         pq_subspaces: int = 32,
     ) -> Tachiom:
         """Build an index from in-memory numpy arrays (full pipeline: TAC → PQ → HNSW).
@@ -148,6 +163,7 @@ class Tachiom:
         Equivalent to build() but accepts numpy arrays instead of file paths.
         Supports memory-mapped arrays (np.load(..., mmap_mode='r')) to minimise RAM
         usage — data is read from the buffer with a single copy into the index.
+        All keyword arguments default to None — see build() for the resolved defaults.
 
         Args:
             vectors:   [N, dim] uint16, C-contiguous.  The u16 bit patterns are
@@ -167,12 +183,12 @@ class Tachiom:
         centroids_path: str,
         assignments_path: str,
         *,
-        pq_sample_size: int = 10_000_000,
-        pq_n_iter: int = 10,
-        normalize: bool = False,
-        pq_seed: int = 42,
-        hnsw_m: int = 32,
-        ef_construction: int = 1500,
+        pq_sample_size: int | None = None,
+        pq_n_iter: int | None = None,
+        normalize: bool | None = None,
+        pq_seed: int | None = None,
+        hnsw_m: int | None = None,
+        ef_construction: int | None = None,
         pq_subspaces: int = 32,
     ) -> Tachiom:
         """Build an index using pre-computed coarse centroids and assignments.
@@ -180,6 +196,7 @@ class Tachiom:
         Skips Token-Aware Clustering and runs PQ training + encoding from
         scratch.  Useful for isolating retrieval differences between the
         clustering step and the residual/PQ encoding step.
+        All keyword arguments default to None — see build() for the resolved defaults.
 
         Args:
             centroids_path:   .npy file, [K, dim] f32 coarse centroids.

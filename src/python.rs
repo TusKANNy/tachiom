@@ -209,15 +209,15 @@ impl PyTachiom {
         doclens_path,
         *,
         total_centroids = None,
-        tac_n_iter = 10,
+        tac_n_iter = None,
         tac_micro_threshold = None,
         tac_small_threshold = None,
-        pq_sample_size = 10_000_000,
-        pq_n_iter = 10,
-        normalize = true,
-        pq_seed = 42,
-        hnsw_m = 32,
-        ef_construction = 1500,
+        pq_sample_size = None,
+        pq_n_iter = None,
+        normalize = None,
+        pq_seed = None,
+        hnsw_m = None,
+        ef_construction = None,
         pq_subspaces = 32,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -228,18 +228,25 @@ impl PyTachiom {
         token_ids_path: &str,
         doclens_path: &str,
         total_centroids: Option<usize>,
-        tac_n_iter: usize,
+        tac_n_iter: Option<usize>,
         tac_micro_threshold: Option<usize>,
         tac_small_threshold: Option<usize>,
-        pq_sample_size: usize,
-        pq_n_iter: usize,
-        normalize: bool,
-        pq_seed: u64,
-        hnsw_m: usize,
-        ef_construction: usize,
+        pq_sample_size: Option<usize>,
+        pq_n_iter: Option<usize>,
+        normalize: Option<bool>,
+        pq_seed: Option<u64>,
+        hnsw_m: Option<usize>,
+        ef_construction: Option<usize>,
         pq_subspaces: usize,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
+        let tac_n_iter = tac_n_iter.unwrap_or(10);
+        let pq_sample_size = pq_sample_size.unwrap_or(10_000_000);
+        let pq_n_iter = pq_n_iter.unwrap_or(10);
+        let normalize = normalize.unwrap_or(true);
+        let pq_seed = pq_seed.unwrap_or(42);
+        let hnsw_m = hnsw_m.unwrap_or(32);
+        let ef_construction = ef_construction.unwrap_or(1500);
         let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
 
         let token_ids_u32: Vec<u32> = token_ids.iter().map(|&x| x as u32).collect();
@@ -286,15 +293,15 @@ impl PyTachiom {
         doclens,
         *,
         total_centroids = None,
-        tac_n_iter = 10,
+        tac_n_iter = None,
         tac_micro_threshold = None,
         tac_small_threshold = None,
-        pq_sample_size = 10_000_000,
-        pq_n_iter = 10,
-        normalize = true,
-        pq_seed = 42,
-        hnsw_m = 32,
-        ef_construction = 1500,
+        pq_sample_size = None,
+        pq_n_iter = None,
+        normalize = None,
+        pq_seed = None,
+        hnsw_m = None,
+        ef_construction = None,
         pq_subspaces = 32,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -305,18 +312,25 @@ impl PyTachiom {
         token_ids: PyReadonlyArray1<'_, u32>,
         doclens: PyReadonlyArray1<'_, i32>,
         total_centroids: Option<usize>,
-        tac_n_iter: usize,
+        tac_n_iter: Option<usize>,
         tac_micro_threshold: Option<usize>,
         tac_small_threshold: Option<usize>,
-        pq_sample_size: usize,
-        pq_n_iter: usize,
-        normalize: bool,
-        pq_seed: u64,
-        hnsw_m: usize,
-        ef_construction: usize,
+        pq_sample_size: Option<usize>,
+        pq_n_iter: Option<usize>,
+        normalize: Option<bool>,
+        pq_seed: Option<u64>,
+        hnsw_m: Option<usize>,
+        ef_construction: Option<usize>,
         pq_subspaces: usize,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
+        let tac_n_iter = tac_n_iter.unwrap_or(10);
+        let pq_sample_size = pq_sample_size.unwrap_or(10_000_000);
+        let pq_n_iter = pq_n_iter.unwrap_or(10);
+        let normalize = normalize.unwrap_or(true);
+        let pq_seed = pq_seed.unwrap_or(42);
+        let hnsw_m = hnsw_m.unwrap_or(32);
+        let ef_construction = ef_construction.unwrap_or(1500);
         let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
 
         let ids_u32 = token_ids
@@ -362,12 +376,12 @@ impl PyTachiom {
         centroids_path,
         assignments_path,
         *,
-        pq_sample_size = 10_000_000,
-        pq_n_iter = 10,
-        normalize = false,
-        pq_seed = 42,
-        hnsw_m = 32,
-        ef_construction = 1500,
+        pq_sample_size = None,
+        pq_n_iter = None,
+        normalize = None,
+        pq_seed = None,
+        hnsw_m = None,
+        ef_construction = None,
         pq_subspaces = 32,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -379,15 +393,21 @@ impl PyTachiom {
         doclens_path: &str,
         centroids_path: &str,
         assignments_path: &str,
-        pq_sample_size: usize,
-        pq_n_iter: usize,
-        normalize: bool,
-        pq_seed: u64,
-        hnsw_m: usize,
-        ef_construction: usize,
+        pq_sample_size: Option<usize>,
+        pq_n_iter: Option<usize>,
+        normalize: Option<bool>,
+        pq_seed: Option<u64>,
+        hnsw_m: Option<usize>,
+        ef_construction: Option<usize>,
         pq_subspaces: usize,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
+        let pq_sample_size = pq_sample_size.unwrap_or(10_000_000);
+        let pq_n_iter = pq_n_iter.unwrap_or(10);
+        let normalize = normalize.unwrap_or(true);
+        let pq_seed = pq_seed.unwrap_or(42);
+        let hnsw_m = hnsw_m.unwrap_or(32);
+        let ef_construction = ef_construction.unwrap_or(1500);
         let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
         let n_tokens = token_ids.len();
 
@@ -753,7 +773,7 @@ impl PyTachiom {
 
 #[pyclass(name = "Tac", module = "tachiom", unsendable)]
 pub struct PyTac {
-    budget: usize,
+    budget: Option<usize>,
     n_iter: usize,
     verbose: bool,
     max_sample_size: Option<usize>,
@@ -773,10 +793,10 @@ impl PyTac {
 #[pymethods]
 impl PyTac {
     #[new]
-    #[pyo3(signature = (n_centroids, *, n_iter = 10, verbose = false, max_sample_size = None, micro_threshold = None, small_threshold = None))]
+    #[pyo3(signature = (n_centroids = None, *, n_iter = None, verbose = false, max_sample_size = None, micro_threshold = None, small_threshold = None))]
     fn new(
-        n_centroids: usize,
-        n_iter: usize,
+        n_centroids: Option<usize>,
+        n_iter: Option<usize>,
         verbose: bool,
         max_sample_size: Option<usize>,
         micro_threshold: Option<usize>,
@@ -784,7 +804,7 @@ impl PyTac {
     ) -> Self {
         PyTac {
             budget: n_centroids,
-            n_iter,
+            n_iter: n_iter.unwrap_or(10),
             verbose,
             max_sample_size,
             micro_threshold,
@@ -808,6 +828,17 @@ impl PyTac {
             )));
         }
 
+        let token_ids_u32: Vec<u32> = token_ids.iter().map(|&x| x as u32).collect();
+        let budget = self.budget.unwrap_or_else(|| {
+            resolve_tac_params(
+                &token_ids_u32,
+                None,
+                self.micro_threshold,
+                self.small_threshold,
+            )
+            .total_centroids
+        });
+
         let mut tac_builder = TacBuilder::new()
             .n_iter(self.n_iter)
             .verbose(self.verbose)
@@ -820,7 +851,6 @@ impl PyTac {
         }
         let tac = tac_builder.build();
 
-        let budget = self.budget;
         let result = py.allow_threads(|| tac.train(&flat_f16, dim, &token_ids, budget));
         self.result = Some(result);
         Ok(())
@@ -869,7 +899,10 @@ impl PyTac {
     fn __repr__(&self) -> String {
         match &self.result {
             Some(r) => format!("<Tac: n_centroids={}, dim={}>", r.n_centroids, r.dim),
-            None => format!("<Tac: budget={}, not yet trained>", self.budget),
+            None => match self.budget {
+                Some(b) => format!("<Tac: budget={b}, not yet trained>"),
+                None => "<Tac: budget=auto, not yet trained>".to_string(),
+            },
         }
     }
 }
