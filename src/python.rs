@@ -474,7 +474,7 @@ impl PyTachiom {
         query, k = 10, *,
         k_centroids = 20,
         k_docs_to_score = 500,
-        ef_search = 30,
+        ef_search = None,
         alpha = Some(0.45),
         beta = None,
         lambda_ = None,
@@ -487,11 +487,12 @@ impl PyTachiom {
         k: usize,
         k_centroids: usize,
         k_docs_to_score: usize,
-        ef_search: usize,
+        ef_search: Option<usize>,
         alpha: Option<f32>,
         beta: Option<usize>,
         lambda_: Option<f32>,
     ) -> PyResult<(Py<PyArray1<f32>>, Py<PyArray1<u32>>)> {
+        let ef_search = ef_search.unwrap_or_else(|| ((k_centroids as f64) * 1.5).round() as usize);
         let dim = self.inner.residuals.encoder().input_dim();
         let q_slice = require_contiguous_2d(&query, dim, "query")?;
         let q_view = DenseMultiVectorView::new(q_slice, dim);
@@ -543,7 +544,7 @@ impl PyTachiom {
         num_threads = 0,
         k_centroids = 20,
         k_docs_to_score = 500,
-        ef_search = 30,
+        ef_search = None,
         alpha = Some(0.45),
         beta = None,
         lambda_ = None,
@@ -559,11 +560,12 @@ impl PyTachiom {
         num_threads: usize,
         k_centroids: usize,
         k_docs_to_score: usize,
-        ef_search: usize,
+        ef_search: Option<usize>,
         alpha: Option<f32>,
         beta: Option<usize>,
         lambda_: Option<f32>,
     ) -> PyResult<(Py<PyArray2<f32>>, Py<PyArray2<u32>>)> {
+        let ef_search = ef_search.unwrap_or_else(|| ((k_centroids as f64) * 1.5).round() as usize);
         let dim = self.inner.residuals.encoder().input_dim();
 
         let tokens_shape = tokens.shape();
