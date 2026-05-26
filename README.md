@@ -154,13 +154,10 @@ huggingface-cli download tuskanny/lotte_pooled_colbertv2 --repo-type dataset --l
 
 This software is released under the **MIT License** (see [LICENSE](LICENSE)).
 
-### Citation license
+## Citation
 
-By downloading and using this software, you agree to cite the following paper in any material you produce where it was used to conduct a search or experimentation, whether it be a research paper, dissertation, article, poster, presentation, or documentation. By using this software, you have agreed to the citation license.
+If you use this software in your research, please cite our paper (accepted at **SIGIR 2026**, full proceedings entry available after the conference):
 
-## Bibliography
-
-This paper has been accepted at **SIGIR 2026**. The full proceedings entry will be available after the conference.
 
 ```bibtex
 @misc{martinico2026efficientmultivectorretrievaltokenaware,
