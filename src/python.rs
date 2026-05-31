@@ -219,6 +219,7 @@ impl PyTachiom {
         hnsw_m = None,
         ef_construction = None,
         pq_subspaces = 32,
+        center_dataset = true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build(
@@ -238,6 +239,7 @@ impl PyTachiom {
         hnsw_m: Option<usize>,
         ef_construction: Option<usize>,
         pq_subspaces: usize,
+        center_dataset: bool,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
         let tac_n_iter = tac_n_iter.unwrap_or(10);
@@ -273,6 +275,7 @@ impl PyTachiom {
             hnsw_params: HNSWBuildConfiguration::default()
                 .with_num_neighbors(hnsw_m)
                 .with_ef_construction(ef_construction),
+            center_dataset,
         };
 
         let inner = py.allow_threads(|| Tachiom::<M_FIXED>::build_index(dataset, &params));
@@ -303,6 +306,7 @@ impl PyTachiom {
         hnsw_m = None,
         ef_construction = None,
         pq_subspaces = 32,
+        center_dataset = true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn build_from_arrays(
@@ -322,6 +326,7 @@ impl PyTachiom {
         hnsw_m: Option<usize>,
         ef_construction: Option<usize>,
         pq_subspaces: usize,
+        center_dataset: bool,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
         let tac_n_iter = tac_n_iter.unwrap_or(10);
@@ -359,6 +364,7 @@ impl PyTachiom {
             hnsw_params: HNSWBuildConfiguration::default()
                 .with_num_neighbors(hnsw_m)
                 .with_ef_construction(ef_construction),
+            center_dataset,
         };
 
         let inner = py.allow_threads(|| Tachiom::<M_FIXED>::build_index(dataset, &params));
@@ -429,6 +435,7 @@ impl PyTachiom {
             hnsw_params: HNSWBuildConfiguration::default()
                 .with_num_neighbors(hnsw_m)
                 .with_ef_construction(ef_construction),
+            center_dataset: false, // externally-supplied centroids; caller controls preprocessing
         };
 
         let inner = py.allow_threads(|| {
@@ -754,8 +761,15 @@ impl PyTachiom {
         let decoded = self.inner.residuals.encoder().decode_vector(encoded);
         let n_tokens = decoded.num_vecs();
         let dim = decoded.dim();
-        let array = ndarray::Array2::from_shape_vec((n_tokens, dim), decoded.values().to_vec())
+        let mut array = ndarray::Array2::from_shape_vec((n_tokens, dim), decoded.values().to_vec())
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if let Some(mean) = &self.inner.dataset_mean {
+            for mut row in array.rows_mut() {
+                for (v, &m) in row.iter_mut().zip(mean.iter()) {
+                    *v += m;
+                }
+            }
+        }
         Ok(array.into_pyarray(py).unbind())
     }
 

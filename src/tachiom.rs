@@ -109,6 +109,13 @@ pub struct Tachiom<const M: usize> {
 
     /// Maximum number of tokens in any single document (cached for scratchpad pre-allocation).
     pub max_doc_tokens: usize,
+
+    /// Per-dimension mean subtracted from all token vectors at build time (mean-centering).
+    /// Present only when the index was built with `center_dataset = true`.
+    /// Subtracting the mean shifts all scores by a query-dependent constant that is
+    /// identical for every document, so rankings are fully preserved.
+    #[serde(default)]
+    pub dataset_mean: Option<Box<[f32]>>,
 }
 
 impl<const M: usize> Tachiom<M> {
@@ -181,6 +188,7 @@ impl<const M: usize> Tachiom<M> {
             offsets,
             residuals: dataset,
             max_doc_tokens,
+            dataset_mean: None,
         }
     }
 
@@ -814,6 +822,11 @@ pub struct TachiomBuildParams {
 
     /// HNSW build configuration for the coarse-centroid index.
     pub hnsw_params: HNSWBuildConfiguration,
+
+    /// Subtract the dataset mean from every token vector before building.
+    /// May improve HNSW quality.
+    /// Rankings are preserved: centering shifts every score by the same constant -<mean, query>.
+    pub center_dataset: bool,
 }
 
 impl Default for TachiomBuildParams {
@@ -831,6 +844,7 @@ impl Default for TachiomBuildParams {
             hnsw_params: HNSWBuildConfiguration::default()
                 .with_num_neighbors(32)
                 .with_ef_construction(1500),
+            center_dataset: true,
         }
     }
 }
@@ -930,6 +944,46 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
             n_docs, n_tokens, token_dim
         );
 
+        // ── Optional: mean-center the dataset ────────────────────────────────
+        // Scores shift by -<mean, query> (same constant for every doc), so rankings are unchanged.
+        let (centered_buf, dataset_mean) = if params.center_dataset {
+            use rayon::prelude::*;
+            println!("[Tachiom::build_index] Computing dataset mean for centering...");
+            let mean_f64: Vec<f64> = flat_f16
+                .par_chunks_exact(token_dim)
+                .fold(
+                    || vec![0.0f64; token_dim],
+                    |mut acc, chunk| {
+                        acc.iter_mut()
+                            .zip(chunk)
+                            .for_each(|(a, &v)| *a += v.to_f32() as f64);
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![0.0f64; token_dim],
+                    |mut a, b| {
+                        a.iter_mut().zip(&b).for_each(|(x, y)| *x += y);
+                        a
+                    },
+                );
+            let n = n_tokens as f64;
+            let mean_f32: Box<[f32]> = mean_f64.iter().map(|&m| (m / n) as f32).collect();
+            let centered: Vec<f16> = flat_f16
+                .par_chunks_exact(token_dim)
+                .flat_map_iter(|chunk| {
+                    chunk
+                        .iter()
+                        .zip(mean_f32.iter())
+                        .map(|(&v, &m)| f16::from_f32(v.to_f32() - m))
+                })
+                .collect();
+            (Some(centered), Some(mean_f32))
+        } else {
+            (None, None)
+        };
+        let flat_f16_ref: &[f16] = centered_buf.as_deref().unwrap_or(flat_f16);
+
         // ── Step 1: Token-Aware Clustering ───────────────────────────────────
         assert_eq!(
             params.token_ids.len(),
@@ -948,7 +1002,7 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
         }
         let tac = tac_builder.build();
         let tac_result = tac.train(
-            flat_f16,
+            flat_f16_ref,
             token_dim,
             &params.token_ids,
             params.total_centroids,
@@ -959,15 +1013,17 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
         let centroids_f16 = tac_result.centroids;
 
         // ── Steps 2–6: PQ training, encoding, HNSW, inverted lists ──────────────
-        Self::build_from_tac_parts(
+        let mut tachiom = Self::build_from_tac_parts(
             centroids_f16,
             n_centroids,
             assignments_usize,
-            flat_f16,
+            flat_f16_ref,
             token_dim,
             &doc_token_counts,
             params,
-        )
+        );
+        tachiom.dataset_mean = dataset_mean;
+        tachiom
     }
 
     fn search<'q>(

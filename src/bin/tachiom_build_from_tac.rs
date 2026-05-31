@@ -164,6 +164,7 @@ fn main() -> anyhow::Result<()> {
         hnsw_params: HNSWBuildConfiguration::default()
             .with_num_neighbors(args.hnsw_m)
             .with_ef_construction(args.ef_construction),
+        center_dataset: false, // externally-supplied centroids; caller controls preprocessing
     };
 
     let build_start = Instant::now();

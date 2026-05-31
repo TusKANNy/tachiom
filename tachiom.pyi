@@ -121,6 +121,7 @@ class Tachiom:
         hnsw_m: int | None = None,
         ef_construction: int | None = None,
         pq_subspaces: int = 32,
+        center_dataset: bool = True,
     ) -> Tachiom:
         """Build an index from .npy inputs (full pipeline: TAC → PQ → HNSW).
 
@@ -136,6 +137,7 @@ class Tachiom:
             hnsw_m:              32
             ef_construction:     1500
             pq_subspaces:        32 (only supported value; others fall back to 32)
+            center_dataset:      True (subtract global mean vector to make centroids more isotropic; improves HNSW search quality)
         """
         ...
 
@@ -157,6 +159,7 @@ class Tachiom:
         hnsw_m: int | None = None,
         ef_construction: int | None = None,
         pq_subspaces: int = 32,
+        center_dataset: bool = True,
     ) -> Tachiom:
         """Build an index from in-memory numpy arrays (full pipeline: TAC → PQ → HNSW).
 

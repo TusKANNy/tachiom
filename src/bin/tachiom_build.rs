@@ -75,6 +75,11 @@ struct Args {
     /// Number of PQ subspaces (only M=32 is currently supported)
     #[clap(long, default_value_t = 32)]
     pq_subspaces: usize,
+
+    /// Subtract the dataset mean from all token vectors before building.
+    /// Pass --center-dataset false to disable.
+    #[clap(long, default_value_t = true)]
+    center_dataset: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -171,6 +176,7 @@ fn main() -> anyhow::Result<()> {
         hnsw_params: HNSWBuildConfiguration::default()
             .with_num_neighbors(args.hnsw_m)
             .with_ef_construction(args.ef_construction),
+        center_dataset: args.center_dataset,
     };
 
     let build_start = Instant::now();
