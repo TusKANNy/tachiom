@@ -1,6 +1,6 @@
 [package]
 name = "tachiom"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 
 [lib]
@@ -23,7 +23,7 @@ ndarray     = "0.16"
 ndarray-npy = "0.9"
 pyo3        = { version = "0.24", features = ["extension-module"], optional = true }
 numpy       = { version = "0.24", optional = true, features = ["half"] }
-vectorium   = { git = "https://github.com/TusKANNy/vectorium.git" }
+vectorium   = { git = "https://github.com/TusKANNy/vectorium.git", features = ["multivec"] }
 kannolo     = { git = "https://github.com/TusKANNy/kannolo.git" }
 
 [[bin]]
