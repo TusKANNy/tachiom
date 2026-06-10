@@ -13,6 +13,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: PyO3/maturin-action@v1
+        env:
+          # AVX2/FMA/BMI2 baseline (Haswell, 2013+) — lets LLVM auto-vectorize
+          # the distance/MaxSim kernels at AVX2 width instead of SSE2.
+          RUSTFLAGS: -C target-cpu=x86-64-v3
         with:
           maturin-version: latest
           rust-toolchain: nightly
@@ -29,11 +33,19 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+        include:
+          - target: x86_64-apple-darwin
+            # AVX2/FMA/BMI2 baseline (Haswell, 2013+) — lets LLVM auto-vectorize
+            # the distance/MaxSim kernels at AVX2 width instead of SSE2.
+            rustflags: "-C target-cpu=x86-64-v3"
+          - target: aarch64-apple-darwin
+            rustflags: ""
     steps:
       - uses: actions/checkout@v4
 
       - uses: PyO3/maturin-action@v1
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         with:
           maturin-version: latest
           rust-toolchain: nightly
