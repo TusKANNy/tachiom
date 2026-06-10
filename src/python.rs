@@ -28,6 +28,11 @@ use std::io::{BufReader, Read};
 /// `pq_subspaces` kwarg is validated against this value (warns if different).
 const M_FIXED: usize = 32;
 
+/// Number of centroids per PQ subspace (vectorium's `KSUB`, fixed at 256 = 2^8).
+/// K-means cannot cluster fewer than this many training points into this many
+/// centroids, so the corpus must contain at least this many tokens in total.
+const PQ_KSUB: usize = 256;
+
 /// Minimum points per centroid — mirrors the TAC allocation strategy constant.
 const MIN_PTS_PER_CENTROID: usize = 39;
 /// Safety factor applied to the minimum TAC budget when computing the floor.
@@ -250,6 +255,7 @@ impl PyTachiom {
         let hnsw_m = hnsw_m.unwrap_or(32);
         let ef_construction = ef_construction.unwrap_or(1500);
         let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
+        require_min_tokens(token_ids.len())?;
 
         let token_ids_u32: Vec<u32> = token_ids.iter().map(|&x| x as u32).collect();
         let resolved = resolve_tac_params(
@@ -336,6 +342,7 @@ impl PyTachiom {
         let pq_seed = pq_seed.unwrap_or(42);
         let hnsw_m = hnsw_m.unwrap_or(32);
         let ef_construction = ef_construction.unwrap_or(1500);
+        require_min_tokens(token_ids.len())?;
         let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
 
         let ids_u32 = token_ids
@@ -416,6 +423,7 @@ impl PyTachiom {
         let ef_construction = ef_construction.unwrap_or(1500);
         let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
         let n_tokens = token_ids.len();
+        require_min_tokens(n_tokens)?;
 
         let (centroids_f32, n_centroids, _dim) = read_f32_2d_npy(centroids_path)?;
         let centroids_f16: Vec<f16> = centroids_f32.iter().map(|&x| f16::from_f32(x)).collect();
@@ -934,6 +942,23 @@ fn warn_saturation_cap(py: Python<'_>, requested: usize, sat_cap: usize) -> PyRe
     );
     let warnings = py.import("warnings")?;
     warnings.call_method1("warn", (msg,))?;
+    Ok(())
+}
+
+/// Validate that the corpus has enough tokens for PQ codebook training.
+///
+/// PQ trains `PQ_KSUB` (256) centroids per subspace via k-means, which requires
+/// at least that many training points. Smaller corpora cause vectorium's
+/// k-means to panic (and abort the process, since panics cannot cross the
+/// PyO3 boundary), so we raise a clear `ValueError` instead.
+fn require_min_tokens(n_tokens: usize) -> PyResult<()> {
+    if n_tokens < PQ_KSUB {
+        return Err(PyValueError::new_err(format!(
+            "Corpus has only {n_tokens} token(s), but PQ codebook training \
+             requires at least {PQ_KSUB} tokens. \
+             Please provide a larger corpus."
+        )));
+    }
     Ok(())
 }
 
