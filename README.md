@@ -156,17 +156,24 @@ This software is released under the **MIT License** (see [LICENSE](LICENSE)).
 
 ## Citation
 
-If you use this software in your research, please cite our paper (accepted at **SIGIR 2026**, full proceedings entry available after the conference):
+If you use this software in your research, please cite our **SIGIR 2026** paper:
 
 
 ```bibtex
-@misc{martinico2026efficientmultivectorretrievaltokenaware,
-      title={Efficient Multivector Retrieval with Token-Aware Clustering and Hierarchical Indexing}, 
-      author={Silvio Martinico and Franco Maria Nardini and Cosimo Rulli and Rossano Venturini},
-      year={2026},
-      eprint={2604.28142},
-      archivePrefix={arXiv},
-      primaryClass={cs.IR},
-      url={https://arxiv.org/abs/2604.28142}, 
+@inproceedings{10.1145/3805712.3809927,
+author = {Martinico, Silvio and Nardini, Franco Maria and Rulli, Cosimo and Venturini, Rossano},
+title = {Efficient Multivector Retrieval with Token-Aware Clustering and Hierarchical Indexing},
+year = {2026},
+isbn = {9798400725999},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3805712.3809927},
+doi = {10.1145/3805712.3809927},
+booktitle = {Proceedings of the 49th International ACM SIGIR Conference on Research and Development in Information Retrieval},
+pages = {3982–3987},
+numpages = {6},
+keywords = {multivector retrieval, late interaction, clustering, efficiency},
+location = {Australia},
+series = {SIGIR '26}
 }
 ```
