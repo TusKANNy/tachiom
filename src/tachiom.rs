@@ -4,7 +4,6 @@ use std::collections::BinaryHeap;
 use vectorium::Distance;
 
 use rustc_hash::FxHashMap;
-use rustc_hash::FxHashSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +117,86 @@ pub struct Tachiom<const M: usize> {
     pub dataset_mean: Option<Box<[f32]>>,
 }
 
+/// Build deduplicated per-centroid inverted lists from token assignments.
+///
+/// Each document appears at most once in a centroid's inverted list, and
+/// document IDs are stored in ascending order.
+fn build_inverted_lists(
+    assignments: &[usize],
+    ds_offsets: &[usize],
+    output_dim: usize,
+    n_centroids: usize,
+) -> (Vec<u32>, Vec<usize>) {
+    // Build the flat inverted lists in two passes rather than keeping a hash
+    // set for every centroid: count each list first, then write directly into
+    // its final range.
+    fn for_each_unique_centroid<F: FnMut(usize, usize)>(
+        assignments: &[usize],
+        ds_offsets: &[usize],
+        output_dim: usize,
+        n_centroids: usize,
+        mut body: F,
+    ) {
+        let mut doc_centroids: Vec<usize> = Vec::new();
+        let mut token_idx = 0usize;
+        for doc_id in 0..ds_offsets.len() - 1 {
+            let doc_tokens = (ds_offsets[doc_id + 1] - ds_offsets[doc_id]) / output_dim;
+            doc_centroids.clear();
+            doc_centroids.extend_from_slice(&assignments[token_idx..token_idx + doc_tokens]);
+            token_idx += doc_tokens;
+            doc_centroids.sort_unstable();
+            doc_centroids.dedup();
+            for &c_id in doc_centroids.iter() {
+                assert!(
+                    c_id < n_centroids,
+                    "assignment centroid id {} >= n_centroids {}",
+                    c_id,
+                    n_centroids
+                );
+                body(doc_id, c_id);
+            }
+        }
+        assert_eq!(token_idx, assignments.len());
+    }
+
+    let mut counts: Vec<u32> = vec![0; n_centroids];
+    for_each_unique_centroid(
+        assignments,
+        ds_offsets,
+        output_dim,
+        n_centroids,
+        |_, c_id| counts[c_id] += 1,
+    );
+
+    let mut offsets: Vec<usize> = Vec::with_capacity(n_centroids + 1);
+    offsets.push(0);
+    for &count in &counts {
+        offsets.push(offsets.last().unwrap() + count as usize);
+    }
+    let mut cursors: Vec<usize> = offsets[..n_centroids].to_vec();
+
+    let mut inverted_lists: Vec<u32> = vec![0; *offsets.last().unwrap()];
+    for_each_unique_centroid(
+        assignments,
+        ds_offsets,
+        output_dim,
+        n_centroids,
+        |doc_id, c_id| {
+            inverted_lists[cursors[c_id]] = doc_id as u32;
+            cursors[c_id] += 1;
+        },
+    );
+    debug_assert!(
+        cursors
+            .iter()
+            .zip(offsets[1..].iter())
+            .all(|(cursor, end)| cursor == end),
+        "second pass did not fill every inverted list exactly"
+    );
+
+    (inverted_lists, offsets)
+}
+
 impl<const M: usize> Tachiom<M> {
     /// Build an IVF index from centroids HNSW and token->centroid `assignments`.
     ///
@@ -128,12 +207,7 @@ impl<const M: usize> Tachiom<M> {
         assignments: &[usize],
         dataset: ResidualDataset<M>,
     ) -> Self {
-        let n_documents = dataset.len();
-
         let n_centroids = centroids.n_elements();
-
-        // Group documents per centroid (deduplicated via FxHashSet for faster hashing)
-        let mut groups: Vec<FxHashSet<u32>> = vec![FxHashSet::default(); n_centroids];
 
         let output_dim = dataset.encoder().output_dim();
         let ds_offsets = dataset.offsets();
@@ -149,31 +223,8 @@ impl<const M: usize> Tachiom<M> {
             n_tokens
         );
 
-        let mut token_idx = 0;
-        for doc_id in 0..n_documents {
-            let doc_tokens = (ds_offsets[doc_id + 1] - ds_offsets[doc_id]) / output_dim;
-            for _ in 0..doc_tokens {
-                let c_id = assignments[token_idx];
-                assert!(
-                    c_id < n_centroids,
-                    "assignment centroid id {} >= n_centroids {}",
-                    c_id,
-                    n_centroids
-                );
-                groups[c_id].insert(doc_id as u32);
-                token_idx += 1;
-            }
-        }
-
-        // Flatten groups into inverted_lists (document IDs) and build offsets
-        let mut inverted_lists: Vec<u32> = Vec::new();
-        let mut offsets: Vec<usize> = Vec::with_capacity(n_centroids + 1);
-        offsets.push(0);
-
-        for grp in groups.iter() {
-            inverted_lists.extend(grp.iter().copied());
-            offsets.push(inverted_lists.len());
-        }
+        let (inverted_lists, offsets) =
+            build_inverted_lists(assignments, ds_offsets, output_dim, n_centroids);
 
         // Compute maximum tokens per document for scratchpad pre-allocation
         let max_doc_tokens = ds_offsets
@@ -1052,3 +1103,30 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
 }
 
 impl<const M: usize> IndexSerializer for Tachiom<M> {}
+
+#[cfg(test)]
+mod tests {
+    use super::build_inverted_lists;
+
+    #[test]
+    fn inverted_lists_deduplicate_documents_and_are_sorted() {
+        // Repeated centroids within a document, a zero-token document, one
+        // centroid shared across documents, and several empty inverted lists.
+        let docs: Vec<Vec<usize>> = vec![vec![2, 5, 5, 9], vec![2, 2, 7], vec![], vec![5, 9, 9]];
+        let n_centroids = 10;
+        let output_dim = 8;
+        let assignments: Vec<usize> = docs.iter().flatten().copied().collect();
+        let mut ds_offsets = vec![0usize];
+        for doc in &docs {
+            ds_offsets.push(ds_offsets.last().unwrap() + doc.len() * output_dim);
+        }
+
+        let (lists, offsets) =
+            build_inverted_lists(&assignments, &ds_offsets, output_dim, n_centroids);
+
+        // centroid 2 -> [0, 1], centroid 5 -> [0, 3], centroid 7 -> [1],
+        // centroid 9 -> [0, 3]; every other inverted list is empty.
+        assert_eq!(lists, vec![0, 1, 0, 3, 1, 0, 3]);
+        assert_eq!(offsets, vec![0, 0, 0, 2, 2, 2, 4, 4, 5, 5, 7]);
+    }
+}
