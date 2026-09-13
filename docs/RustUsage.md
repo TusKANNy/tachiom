@@ -90,6 +90,38 @@ Runs the full pipeline (TAC → PQ training → encoding → HNSW) and saves the
 | `--hnsw-m` | `32` | HNSW neighbours per node in the centroid graph |
 | `--ef-construction` | `1500` | HNSW build-time beam width |
 | `--pq-subspaces` | `32` | PQ subspace count (only 32 is currently supported) |
+| `--center-dataset` | `true` | Subtract the dataset mean before building; pass `--center-dataset false` to disable |
+| `--timings` | off | Print a per-stage timing breakdown (see below) |
+
+### Stage timings
+
+`--timings` makes the build print one `[timing] <stage>: <elapsed>` line per stage, so a log can 
+be reduced to its breakdown with `grep '\[timing\]'`:
+
+```
+[timing] data_loading: 389.40s
+[timing] center_dataset: 92.82s
+[timing] tac.group_by_token_id: 20.41s
+[timing] tac.allocation_weights: 19.42s
+[timing] tac.per_token_kmeans: 5979.12s
+[timing] tac.concat_and_remap: 12.72s
+[timing] tac.total: 6031.67s
+[timing] pq_sample_selection: 48.48s
+[timing] pq_training: 186.38s
+[timing] residual_encoding: 564.44s
+[timing] hnsw_centroids: 1382.69s
+[timing] inverted_lists: 25.98s
+```
+
+Note that `residual_encoding` covers both the residual computation and the PQ code assignment:
+they run in a single fused per-token loop and cannot be separated without instrumenting that
+loop.
+
+The same output can be enabled with the `TACHIOM_TIMINGS=1` environment variable, which also
+covers the other binaries and the Python bindings — they share the timing probes but have no
+`--timings` flag of their own. (From Python the lines bypass `sys.stdout` and so are not
+visible in Jupyter notebooks — see [PythonUsage.md](PythonUsage.md).) Timings are off by default and cost one `Instant::now()` plus one
+atomic load per stage when disabled.
 
 ### Example
 

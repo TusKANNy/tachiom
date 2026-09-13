@@ -78,12 +78,21 @@ struct Args {
 
     /// Subtract the dataset mean from all token vectors before building.
     /// Pass --center-dataset false to disable.
-    #[clap(long, default_value_t = true)]
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
     center_dataset: bool,
+
+    /// Print a `[timing] <stage>: <elapsed>` line for each build stage.
+    /// Can also be enabled with the TACHIOM_TIMINGS environment variable.
+    #[clap(long)]
+    timings: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if args.timings {
+        tachiom::timing::set_enabled(true);
+    }
 
     if args.pq_subspaces != 32 {
         anyhow::bail!("Only --pq-subspaces 32 is currently supported");
@@ -139,10 +148,12 @@ fn main() -> anyhow::Result<()> {
         n_tokens
     );
     println!("  {} docs, {} tokens total", n_docs, n_tokens);
+    tachiom::timing::report("data_loading", load_start);
 
     // ── Build TachiomInputDataset ─────────────────────────────────────────────
     // PlainMultiVecQuantizer is a pass-through encoder; no transformation needed.
     println!("\nBuilding raw multivector dataset...");
+    let prep_start = Instant::now();
     let encoder = PlainMultiVecQuantizer::<f16>::new(dim);
     let mut offsets: Vec<usize> = Vec::with_capacity(doclens.len() + 1);
     offsets.push(0usize);
@@ -160,6 +171,7 @@ fn main() -> anyhow::Result<()> {
         offsets.into_boxed_slice(),
         encoder,
     );
+    tachiom::timing::report("dataset_assembly", prep_start);
 
     // ── Build index ───────────────────────────────────────────────────────────
     println!("\n=== Building Tachiom index ===");

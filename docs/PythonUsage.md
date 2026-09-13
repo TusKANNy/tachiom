@@ -49,6 +49,23 @@ index = tachiom.Tachiom.build(
 )
 ```
 
+#### Stage timings
+
+Setting `TACHIOM_TIMINGS=1` makes the build print one `[timing] <stage>: <elapsed>` line per
+stage as it completes (`tac.*`, `pq_training`, `residual_encoding`, `hnsw_centroids`,
+`inverted_lists`, …). The `data_loading` and `dataset_assembly` stages are specific to
+`tachiom_build` and do not appear here, since arrays are passed in directly.
+
+**These lines are not available in Jupyter notebooks.** They are written by the Rust extension
+to file descriptor 1, not to `sys.stdout`, so anything that captures Python-level output —
+IPython cell capture, `contextlib.redirect_stdout`, pytest's `capsys` — will not see them. In a
+notebook they go to the terminal that started the kernel. To collect them programmatically, run
+the build in a subprocess and read its stdout.
+
+For the same reason, when stdout is piped rather than attached to a terminal, these lines can
+appear out of order relative to Python `print()` calls: Rust flushes per line while Python
+block-buffers. Run with `python -u` (or `print(..., flush=True)`) if interleaved order matters.
+
 #### From pre-computed TAC output
 
 If you have already run TAC (e.g. to inspect centroids or tune the centroid budget separately), skip the clustering step:

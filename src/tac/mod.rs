@@ -214,10 +214,12 @@ impl TokenAwareClustering {
         let train_start = Instant::now();
 
         // ── Group vector indices by token id ──────────────────────────────────
+        let group_start = Instant::now();
         let mut token_groups: HashMap<usize, Vec<usize>> = HashMap::new();
         for (idx, &tid) in token_ids.iter().enumerate() {
             token_groups.entry(tid).or_default().push(idx);
         }
+        crate::timing::report("tac.group_by_token_id", group_start);
 
         if self.verbose {
             println!(
@@ -277,6 +279,7 @@ impl TokenAwareClustering {
         }
 
         // ── Centroid budget allocation ─────────────────────────────────────────
+        let alloc_start = Instant::now();
         let allocation = allocate_centroids_damped_spread(
             &token_groups,
             data,
@@ -286,12 +289,14 @@ impl TokenAwareClustering {
             small_threshold,
             self.verbose,
         );
+        crate::timing::report("tac.allocation_weights", alloc_start);
 
         // ── Per-token k-means (parallel) ──────────────────────────────────────
         if self.verbose {
             println!("\n=== Training per-token k-means ===");
         }
 
+        let kmeans_start = Instant::now();
         let results: Vec<(
             usize,
             PlainDenseDataset<f16, SquaredEuclideanDistance>,
@@ -311,12 +316,14 @@ impl TokenAwareClustering {
                 (token_id, centroids, local_assignments)
             })
             .collect();
+        crate::timing::report("tac.per_token_kmeans", kmeans_start);
 
         // ── Concatenate centroids, remap assignments to global ids ────────────
         if self.verbose {
             println!("\n=== Concatenating centroids and remapping assignments ===");
         }
 
+        let remap_start = Instant::now();
         // Sort by token_id for a deterministic, reproducible layout.
         let mut sorted = results;
         sorted.sort_by_key(|(tid, _, _)| *tid);
@@ -337,6 +344,8 @@ impl TokenAwareClustering {
         }
 
         let n_centroids = all_centroids.len() / dim;
+        crate::timing::report("tac.concat_and_remap", remap_start);
+        crate::timing::report("tac.total", train_start);
 
         if self.verbose {
             println!(
