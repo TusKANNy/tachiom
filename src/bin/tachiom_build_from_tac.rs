@@ -6,7 +6,6 @@ use std::time::Instant;
 
 use tachiom::hnsw::HNSWBuildConfiguration;
 use tachiom::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
-use vectorium::core::index::Index;
 use vectorium::{IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
 
 #[derive(Parser, Debug)]

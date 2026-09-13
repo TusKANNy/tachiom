@@ -5,8 +5,8 @@ use std::fs::File;
 use std::io::{BufReader, Write};
 use std::time::Instant;
 
-use tachiom::tachiom::{Tachiom, TachiomInputDataset, TachiomSearchParams};
-use vectorium::core::index::Index;
+use tachiom::tachiom::{Tachiom, TachiomSearchParams};
+use vectorium::core::index::{Index, IndexStats};
 use vectorium::distances::Distance;
 use vectorium::{Dataset, IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
 
@@ -152,12 +152,7 @@ fn main() -> anyhow::Result<()> {
         results.clear();
 
         for query in query_dataset.iter() {
-            let scored = <Tachiom<32> as Index<TachiomInputDataset>>::search(
-                &index,
-                query,
-                args.k,
-                &search_params,
-            );
+            let scored = <Tachiom<32> as Index>::search(&index, query, args.k, &search_params);
             results.extend(
                 scored
                     .into_iter()

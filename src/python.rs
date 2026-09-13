@@ -6,7 +6,7 @@
 use crate::hnsw::HNSWBuildConfiguration;
 use crate::tac::{TacBuilder, TacResult};
 use crate::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
-use vectorium::core::index::Index;
+use vectorium::core::index::IndexStats;
 use vectorium::vector_encoder::{MultiVecEncoder, VectorEncoder};
 use vectorium::{
     Dataset, DenseMultiVectorView, IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer,
@@ -494,7 +494,7 @@ impl PyTachiom {
         beta = None,
         lambda_ = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn search<'py>(
         &self,
         py: Python<'py>,
@@ -564,7 +564,7 @@ impl PyTachiom {
         beta = None,
         lambda_ = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn batch_search<'py>(
         &self,
         py: Python<'py>,

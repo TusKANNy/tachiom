@@ -9,7 +9,6 @@ use std::time::Instant;
 use tachiom::graph::Graph;
 use tachiom::hnsw::HNSWBuildConfiguration;
 use tachiom::tachiom::Tachiom;
-use vectorium::core::index::Index;
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
 use vectorium::vector_encoder::VectorEncoder;
 use vectorium::{
@@ -239,8 +238,7 @@ fn main() -> anyhow::Result<()> {
     let hnsw_cfg = HNSWBuildConfiguration::default()
         .with_num_neighbors(args.hnsw_m)
         .with_ef_construction(args.ef_construction);
-    let centroids_hnsw: HNSWCentroids =
-        <HNSWCentroids as Index<CentroidDataset>>::build_index(centroid_dataset, &hnsw_cfg);
+    let centroids_hnsw: HNSWCentroids = HNSWCentroids::build_index(centroid_dataset, &hnsw_cfg);
 
     println!("  HNSW built in {:.2?}", t_hnsw.elapsed());
 

@@ -15,7 +15,7 @@ use crate::hnsw::{
 use crate::tac::TacBuilder;
 
 use vectorium::core::dataset::ScoredVector;
-use vectorium::core::index::Index;
+use vectorium::core::index::{Index, IndexStats};
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
 use vectorium::vector_encoder::{QueryEvaluator, VectorEncoder};
 use vectorium::{
@@ -635,7 +635,7 @@ impl<const M: usize> Tachiom<M> {
         k: usize,
         beta: Option<usize>,
     ) -> Vec<(f32, u32)> {
-        let query_evaluator = self.residuals.encoder().query_evaluator(query);
+        let query_evaluator = self.residuals.encoder().query_evaluator(query, &());
         let score_doc = |doc_id: u32| -> f32 {
             let doc_view = self.residuals.get(doc_id as u64);
             query_evaluator.compute_distance(doc_view).0
@@ -956,10 +956,7 @@ impl Default for TachiomSearchParams {
 /// Each document is stored as a variable-length sequence of f16 token vectors.
 pub type TachiomInputDataset = MultiVectorDataset<PlainMultiVecQuantizer<f16>>;
 
-impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
-    type BuildParams = TachiomBuildParams;
-    type SearchParams = TachiomSearchParams;
-
+impl<const M: usize> IndexStats for Tachiom<M> {
     /// Number of indexed documents.
     fn n_elements(&self) -> usize {
         self.residuals.len()
@@ -969,8 +966,10 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
     fn dim(&self) -> usize {
         self.residuals.encoder().input_dim()
     }
+}
 
-    fn print_space_usage_bytes(&self) {
+impl<const M: usize> Tachiom<M> {
+    pub fn print_space_usage_bytes(&self) {
         let (ch, il, off, res) = self.space_usage_components();
         let total = ch + il + off + res;
         println!(
@@ -988,7 +987,7 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
     /// 3. Encode all documents in parallel using the trained encoder.
     /// 4. Build an HNSW index over the coarse centroids.
     /// 5. Build inverted lists mapping centroids → documents.
-    fn build_index(dataset: TachiomInputDataset, params: &TachiomBuildParams) -> Self {
+    pub fn build_index(dataset: TachiomInputDataset, params: &TachiomBuildParams) -> Self {
         let token_dim = dataset.encoder().input_dim();
         let n_docs = dataset.len();
 
@@ -1091,13 +1090,19 @@ impl<const M: usize> Index<TachiomInputDataset> for Tachiom<M> {
         tachiom.dataset_mean = dataset_mean;
         tachiom
     }
+}
+
+impl<const M: usize> Index for Tachiom<M> {
+    type Query<'q> = vectorium::DenseMultiVectorView<'q, f32>;
+    type Distance = DotProduct;
+    type SearchParams = TachiomSearchParams;
 
     fn search<'q>(
-        &'q self,
-        query: vectorium::DenseMultiVectorView<'q, f32>,
+        &self,
+        query: Self::Query<'q>,
         k: usize,
-        search_params: &TachiomSearchParams,
-    ) -> Vec<ScoredVector<DotProduct>> {
+        search_params: &Self::SearchParams,
+    ) -> Vec<ScoredVector<Self::Distance>> {
         self.search(
             query,
             k,
@@ -1143,5 +1148,22 @@ mod tests {
         // centroid 9 -> [0, 3]; every other inverted list is empty.
         assert_eq!(lists, vec![0, 1, 0, 3, 1, 0, 3]);
         assert_eq!(offsets, vec![0, 0, 0, 2, 2, 2, 4, 4, 5, 5, 7]);
+    }
+}
+
+#[cfg(test)]
+mod trait_conformance {
+    use super::*;
+
+    /// Compiles only if `Tachiom<M>` genuinely satisfies vectorium's `Index` and
+    /// `IndexStats`, with the associated types it is expected to expose.
+    #[test]
+    fn tachiom_satisfies_index_and_indexstats() {
+        fn assert_bounds<I>()
+        where
+            I: Index<Distance = DotProduct, SearchParams = TachiomSearchParams> + IndexStats,
+        {
+        }
+        assert_bounds::<Tachiom<32>>();
     }
 }
