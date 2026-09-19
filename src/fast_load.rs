@@ -32,12 +32,18 @@ use half::f16;
 use std::fs::File;
 use std::io::{BufReader, Read};
 
+use vectorium::core::dataset::Dataset;
+use vectorium::core::index::IndexStats;
 use vectorium::{
     DenseDataset, IndexIoError, MultiVecTwoLevelProductQuantizer, MultiVectorDataset,
-    PlainDenseDataset, PlainDenseQuantizer, SquaredEuclideanDistance,
+    PlainDenseDataset, PlainDenseQuantizer, SquaredEuclideanDistance, VectorEncoder,
 };
 
 use crate::tachiom::{HNSWCentroids, Tachiom};
+
+const KSUB: usize = 256;
+
+const COARSE_ID_BYTES: usize = std::mem::size_of::<u32>();
 
 const READ_BUFFER_BYTES: usize = 1 << 20;
 
@@ -120,7 +126,7 @@ impl Reader {
     fn usize(&mut self, field: &str) -> Result<usize> {
         let value = self.u64(field)?;
         usize::try_from(value)
-            .map_err(|_| corrupt_error(format!("{field}: {value} does not fit usize")))
+            .map_err(|_| IndexIoError::Decode(DecodeError::OutsideUsizeRange(value)))
     }
 
     // Bincode uses one-byte 0/1 tags for bool and Option.
@@ -209,11 +215,21 @@ impl Reader {
         })
     }
 
+    fn f32_array_exact(&mut self, field: &str, expected: usize) -> Result<Vec<f32>> {
+        let n = self.usize(field)?;
+        if n != expected {
+            return corrupt(format!("{field}: length {n}, expected {expected}"));
+        }
+        self.typed_values(n, 4, field, |c| {
+            Ok(f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        })
+    }
+
     fn usize_array(&mut self, field: &str) -> Result<Vec<usize>> {
         self.typed_array(8, field, |c| {
             let value = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
             usize::try_from(value)
-                .map_err(|_| corrupt_error(format!("{field}: {value} does not fit usize")))
+                .map_err(|_| IndexIoError::Decode(DecodeError::OutsideUsizeRange(value)))
         })
     }
 }
@@ -238,20 +254,138 @@ fn read_f32_dataset(
     ))
 }
 
+fn validate_offsets(field: &str, offsets: &[usize], data_len: usize) -> Result<()> {
+    if offsets.first() != Some(&0) {
+        return corrupt(format!(
+            "{field}: first offset must be 0, got {:?}",
+            offsets.first()
+        ));
+    }
+    if offsets.last() != Some(&data_len) {
+        return corrupt(format!(
+            "{field}: last offset {:?} does not equal data length {data_len}",
+            offsets.last()
+        ));
+    }
+    if let Some(i) = offsets.windows(2).position(|w| w[1] < w[0]) {
+        return corrupt(format!(
+            "{field}: offsets decrease at index {}: {} -> {}",
+            i + 1,
+            offsets[i],
+            offsets[i + 1]
+        ));
+    }
+    Ok(())
+}
+
+fn validate_encoded_documents(
+    data: &[u8],
+    offsets: &[usize],
+    n_coarse: usize,
+    bytes_per_token: usize,
+) -> Result<()> {
+    for (doc_id, bounds) in offsets.windows(2).enumerate() {
+        let document = &data[bounds[0]..bounds[1]];
+        let span = document.len();
+        if !span.is_multiple_of(bytes_per_token) {
+            return corrupt(format!(
+                "residuals document {doc_id}: {span} bytes is not divisible by encoded width {bytes_per_token}"
+            ));
+        }
+        let n_tokens = span / bytes_per_token;
+        let coarse_bytes = n_tokens.checked_mul(COARSE_ID_BYTES).ok_or_else(|| {
+            corrupt_error(format!(
+                "residuals document {doc_id}: coarse ID byte count overflows"
+            ))
+        })?;
+        // Vectorium's scorer assumes coarse IDs are in range.
+        for (token, bytes) in document[..coarse_bytes]
+            .as_chunks::<COARSE_ID_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            let id = u32::from_le_bytes(*bytes) as usize;
+            if id >= n_coarse {
+                return corrupt(format!(
+                    "residuals document {doc_id}, token {token}: coarse centroid {id} is out of range for {n_coarse} centroids"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn load_index<const M: usize>(path: &str) -> Result<Tachiom<M>> {
+    if M == 0 || !M.is_multiple_of(4) {
+        return corrupt(format!(
+            "Tachiom M must be nonzero and divisible by 4, got {M}"
+        ));
+    }
     let mut reader = Reader::open(path)?;
 
     let centroids: HNSWCentroids = bincode::serde::decode_from_std_read(&mut reader, config())?;
+    let n_centroids = centroids.n_elements();
+    let levels = centroids.nodes_per_level();
+    if n_centroids == 0 || levels.last() != Some(&n_centroids) {
+        return corrupt(format!(
+            "invalid HNSW ground level size {:?} for {n_centroids} centroids",
+            levels.last()
+        ));
+    }
+    if n_centroids > u32::MAX as usize {
+        return corrupt(format!("{n_centroids} centroids exceed the u32 ID range"));
+    }
 
     let inverted_lists = reader.u32_array("Tachiom.inverted_lists")?;
     let offsets = reader.usize_array("Tachiom.offsets")?;
+    validate_offsets("Tachiom.offsets", &offsets, inverted_lists.len())?;
+    // Search reads offsets[cidx + 1], so the sentinel is required.
+    if offsets.len() - 1 != n_centroids {
+        return corrupt(format!(
+            "Tachiom.offsets has {} entries for {n_centroids} centroids",
+            offsets.len()
+        ));
+    }
 
     let residual_data = reader.byte_array("residuals.data")?;
     let doc_offsets = reader.usize_array("residuals.offsets")?;
+    validate_offsets("residuals.offsets", &doc_offsets, residual_data.len())?;
+    let n_docs = doc_offsets.len() - 1;
+    if n_docs > u32::MAX as usize {
+        return corrupt(format!("{n_docs} documents exceed the u32 ID range"));
+    }
+    if let Some((position, &doc_id)) = inverted_lists
+        .iter()
+        .enumerate()
+        .find(|&(_, &doc_id)| doc_id as usize >= n_docs)
+    {
+        return corrupt(format!(
+            "Tachiom.inverted_lists[{position}] contains document {doc_id}, but the index has {n_docs} documents"
+        ));
+    }
 
     let token_dim = reader.usize("residuals.encoder.token_dim")?;
-    reader.usize("residuals.encoder.dsub")?;
+    let dsub = reader.usize("residuals.encoder.dsub")?;
     let coarse_centroids = read_f32_dataset(&mut reader, "residuals.encoder.coarse_centroids")?;
+    let n_coarse = coarse_centroids.len();
+    // dsub is serialized separately but derived from token_dim and M.
+    if token_dim == 0
+        || !token_dim.is_multiple_of(M)
+        || dsub != token_dim / M
+        || coarse_centroids.output_dim() != token_dim
+    {
+        return corrupt(format!(
+            "residuals.encoder: token_dim {token_dim}, dsub {dsub}, coarse d {} with M {M}",
+            coarse_centroids.output_dim()
+        ));
+    }
+    if n_centroids != n_coarse || centroids.dim() != token_dim {
+        return corrupt(format!(
+            "centroid mismatch: HNSW is {n_centroids} x {}, residual encoder is {n_coarse} x {token_dim}",
+            centroids.dim()
+        ));
+    }
 
     let n_codebooks = reader.usize("residuals.encoder.pq_centroids.len")?;
     if n_codebooks != M {
@@ -262,13 +396,25 @@ pub(crate) fn load_index<const M: usize>(path: &str) -> Result<Tachiom<M>> {
     let mut codebooks = allocate(M, "residuals.encoder.pq_centroids")?;
     for i in 0..M {
         let field = format!("residuals.encoder.pq_centroids[{i}]");
-        codebooks.push(read_f32_dataset(&mut reader, &field)?);
+        let codebook = read_f32_dataset(&mut reader, &field)?;
+        if codebook.len() != KSUB || codebook.output_dim() != dsub {
+            return corrupt(format!(
+                "{field}: {} x {}, expected {KSUB} x dsub {dsub}",
+                codebook.len(),
+                codebook.output_dim()
+            ));
+        }
+        codebooks.push(codebook);
     }
     let with_norms = reader.flag("residuals.encoder.with_norms")?;
 
     let max_doc_tokens = reader.usize("Tachiom.max_doc_tokens")?;
     let dataset_mean = if reader.flag("Tachiom.dataset_mean")? {
-        Some(reader.f32_array("Tachiom.dataset_mean")?.into_boxed_slice())
+        Some(
+            reader
+                .f32_array_exact("Tachiom.dataset_mean", token_dim)?
+                .into_boxed_slice(),
+        )
     } else {
         None
     };
@@ -279,6 +425,7 @@ pub(crate) fn load_index<const M: usize>(path: &str) -> Result<Tachiom<M>> {
         codebooks,
         with_norms,
     );
+    validate_encoded_documents(&residual_data, &doc_offsets, n_coarse, encoder.output_dim())?;
     let residuals = MultiVectorDataset::from_raw(
         residual_data.into_boxed_slice(),
         doc_offsets.into_boxed_slice(),
@@ -302,6 +449,7 @@ mod tests {
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use std::io::Seek;
     use std::path::PathBuf;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
     use vectorium::{
         DenseMultiVectorView, IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer,
@@ -438,6 +586,399 @@ mod tests {
         assert_eq!(reader.u64("inverted_lists length").unwrap(), expected_len);
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    // Locate fields by walking the serialized layout rather than using fixed offsets.
+
+    struct Layout {
+        mid_prefix_pos: u64,
+        mid_bulk_array_pos: u64,
+        inverted_lists_len_pos: u64,
+        inverted_lists_first_pos: u64,
+        residuals_data_len_pos: u64,
+        residuals_data_first_pos: u64,
+        offsets_first_pos: u64,
+        offsets_second_pos: u64,
+        offsets_last_pos: u64,
+        residuals_offsets_first_pos: u64,
+        residuals_offsets_second_pos: u64,
+        residuals_offsets_last_pos: u64,
+        dsub_pos: u64,
+        coarse_n_vecs_pos: u64,
+        coarse_n_vecs_value: u64,
+        pq_centroids_len_pos: u64,
+        with_norms_pos: u64,
+        dataset_mean_flag_pos: u64,
+        dataset_mean_len_pos: u64,
+        n_docs: usize,
+    }
+
+    struct MalformedFixture {
+        bytes: Vec<u8>,
+        layout: Layout,
+    }
+
+    fn malformed_fixture() -> &'static MalformedFixture {
+        static FIXTURE: OnceLock<MalformedFixture> = OnceLock::new();
+
+        FIXTURE.get_or_init(|| {
+            let path = temp_path("malformed_base");
+            build_fixture(true, true).save_index(&path).unwrap();
+
+            let layout = locate(&path);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+
+            MalformedFixture { bytes, layout }
+        })
+    }
+
+    fn locate(path: &str) -> Layout {
+        let mut reader = Reader::open(path).unwrap();
+        let _: HNSWCentroids = bincode::serde::decode_from_std_read(&mut reader, config()).unwrap();
+        let mid_prefix_pos = reader.pos / 2;
+
+        let inverted_lists_len_pos = reader.pos;
+        let inverted_lists_first_pos = inverted_lists_len_pos + 8;
+        reader.u32_array("inverted_lists").unwrap();
+
+        let offsets_len = reader.pos;
+        let offsets = reader.usize_array("offsets").unwrap();
+        let offsets_first_pos = offsets_len + 8;
+        let offsets_second_pos = offsets_first_pos + 8;
+        let offsets_last_pos = offsets_first_pos + (offsets.len() as u64 - 1) * 8;
+
+        let residuals_data_len_pos = reader.pos;
+        let residuals_data_first_pos = residuals_data_len_pos + 8;
+        reader.byte_array("residuals.data").unwrap();
+        let mid_bulk_array_pos = (residuals_data_len_pos + reader.pos) / 2;
+
+        let residuals_offsets_len = reader.pos;
+        let doc_offsets = reader.usize_array("residuals.offsets").unwrap();
+        let n_docs = doc_offsets.len() - 1;
+        let residuals_offsets_first_pos = residuals_offsets_len + 8;
+        let residuals_offsets_second_pos = residuals_offsets_first_pos + 8;
+        let residuals_offsets_last_pos =
+            residuals_offsets_first_pos + (doc_offsets.len() as u64 - 1) * 8;
+
+        reader.usize("token_dim").unwrap();
+        let dsub_pos = reader.pos;
+        reader.usize("dsub").unwrap();
+        let coarse_n_vecs_pos = reader.pos;
+        let coarse_n_vecs_value = reader.u64("coarse_centroids.n_vecs").unwrap();
+        reader.f32_array("coarse_centroids.data").unwrap();
+        reader.usize("coarse_centroids.d").unwrap();
+
+        let pq_centroids_len_pos = reader.pos;
+        let n_codebooks = reader.usize("pq_centroids.len").unwrap();
+        for _ in 0..n_codebooks {
+            reader.usize("cb.n_vecs").unwrap();
+            reader.f32_array("cb.data").unwrap();
+            reader.usize("cb.d").unwrap();
+        }
+        let with_norms_pos = reader.pos;
+        reader.flag("with_norms").unwrap();
+
+        reader.usize("max_doc_tokens").unwrap();
+        let dataset_mean_flag_pos = reader.pos;
+        reader.flag("dataset_mean").unwrap();
+        let dataset_mean_len_pos = reader.pos;
+
+        Layout {
+            mid_prefix_pos,
+            mid_bulk_array_pos,
+            inverted_lists_len_pos,
+            inverted_lists_first_pos,
+            residuals_data_len_pos,
+            residuals_data_first_pos,
+            offsets_first_pos,
+            offsets_second_pos,
+            offsets_last_pos,
+            residuals_offsets_first_pos,
+            residuals_offsets_second_pos,
+            residuals_offsets_last_pos,
+            dsub_pos,
+            coarse_n_vecs_pos,
+            coarse_n_vecs_value,
+            pq_centroids_len_pos,
+            with_norms_pos,
+            dataset_mean_flag_pos,
+            dataset_mean_len_pos,
+            n_docs,
+        }
+    }
+
+    fn read_u64_at(bytes: &[u8], pos: u64) -> u64 {
+        let pos = pos as usize;
+        u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap())
+    }
+
+    fn write_u64_at(bytes: &mut [u8], pos: u64, value: u64) {
+        let pos = pos as usize;
+        bytes[pos..pos + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32_at(bytes: &mut [u8], pos: u64, value: u32) {
+        let pos = pos as usize;
+        bytes[pos..pos + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn assert_corrupt_contains(name: &str, bytes: &[u8], expected: &str) {
+        let path = temp_path(name);
+        std::fs::write(&path, bytes).unwrap();
+
+        let result = Tachiom::<M>::load_index(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        match result {
+            Err(IndexIoError::Decode(DecodeError::OtherString(message))) => assert!(
+                message.contains(expected),
+                "{name}: expected {expected:?}, got {message:?}"
+            ),
+            Err(error) => panic!("{name}: unexpected error {error:?}"),
+            Ok(_) => panic!("{name}: expected load_index to reject this fixture"),
+        }
+    }
+
+    fn assert_decode_error(name: &str, bytes: &[u8]) {
+        let path = temp_path(name);
+        std::fs::write(&path, bytes).unwrap();
+
+        let result = Tachiom::<M>::load_index(&path);
+        std::fs::remove_file(&path).unwrap();
+
+        match result {
+            Err(IndexIoError::Decode(_)) => {}
+            Err(error) => panic!("{name}: unexpected error {error:?}"),
+            Ok(_) => panic!("{name}: expected load_index to reject this fixture"),
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_files() {
+        let fixture = malformed_fixture();
+        let base = &fixture.bytes;
+
+        for (name, end) in [
+            (
+                "truncated_in_hnsw_prefix",
+                fixture.layout.mid_prefix_pos as usize,
+            ),
+            (
+                "truncated_in_bulk_array",
+                fixture.layout.mid_bulk_array_pos as usize,
+            ),
+            ("truncated_one_byte_short", base.len() - 1),
+        ] {
+            assert_decode_error(name, &base[..end]);
+        }
+    }
+
+    #[test]
+    fn rejects_nonzero_first_offsets() {
+        let fixture = malformed_fixture();
+
+        for (name, pos) in [
+            (
+                "tachiom_offsets_first_nonzero",
+                fixture.layout.offsets_first_pos,
+            ),
+            (
+                "residuals_offsets_first_nonzero",
+                fixture.layout.residuals_offsets_first_pos,
+            ),
+        ] {
+            let mut bytes = fixture.bytes.clone();
+            write_u64_at(&mut bytes, pos, 5);
+            assert_corrupt_contains(name, &bytes, "first offset must be 0");
+        }
+    }
+
+    #[test]
+    fn rejects_non_monotonic_offsets() {
+        let fixture = malformed_fixture();
+
+        for (name, pos) in [
+            (
+                "tachiom_offsets_decreasing",
+                fixture.layout.offsets_second_pos,
+            ),
+            (
+                "residuals_offsets_decreasing",
+                fixture.layout.residuals_offsets_second_pos,
+            ),
+        ] {
+            let mut bytes = fixture.bytes.clone();
+            let next = read_u64_at(&bytes, pos + 8);
+            write_u64_at(&mut bytes, pos, next + 1);
+            assert_corrupt_contains(name, &bytes, "offsets decrease at index");
+        }
+    }
+
+    #[test]
+    fn rejects_mismatched_last_offsets() {
+        let fixture = malformed_fixture();
+
+        for (name, pos) in [
+            (
+                "tachiom_offsets_last_mismatch",
+                fixture.layout.offsets_last_pos,
+            ),
+            (
+                "residuals_offsets_last_mismatch",
+                fixture.layout.residuals_offsets_last_pos,
+            ),
+        ] {
+            let mut bytes = fixture.bytes.clone();
+            let original = read_u64_at(&bytes, pos);
+            write_u64_at(&mut bytes, pos, original + 1);
+            assert_corrupt_contains(name, &bytes, "does not equal data length");
+        }
+    }
+
+    #[test]
+    fn rejects_declared_length_overruns() {
+        let fixture = malformed_fixture();
+        let base = &fixture.bytes;
+        let overflowing_u32_len = (usize::MAX / 4 + 1) as u64;
+
+        for (name, len_pos, width, value, expected) in [
+            (
+                "inverted_lists_length_overflow",
+                fixture.layout.inverted_lists_len_pos,
+                4u64,
+                overflowing_u32_len,
+                "bytes overflow usize",
+            ),
+            (
+                "inverted_lists_length_past_remaining",
+                fixture.layout.inverted_lists_len_pos,
+                4,
+                0,
+                "overruns the file",
+            ),
+            (
+                "residuals_data_length_past_remaining",
+                fixture.layout.residuals_data_len_pos,
+                1,
+                0,
+                "overruns the file",
+            ),
+        ] {
+            let mut bytes = base.clone();
+            let declared = if value == 0 {
+                (base.len() as u64 - len_pos - 8) / width + 1
+            } else {
+                value
+            };
+            write_u64_at(&mut bytes, len_pos, declared);
+            assert_corrupt_contains(name, &bytes, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_flags_and_shapes() {
+        let fixture = malformed_fixture();
+
+        for (name, pos) in [
+            ("with_norms_flag_invalid", fixture.layout.with_norms_pos),
+            (
+                "dataset_mean_tag_invalid",
+                fixture.layout.dataset_mean_flag_pos,
+            ),
+        ] {
+            let mut bytes = fixture.bytes.clone();
+            bytes[pos as usize] = 2;
+            assert_corrupt_contains(name, &bytes, "expected 0 or 1");
+        }
+
+        let mut bytes = fixture.bytes.clone();
+        write_u64_at(
+            &mut bytes,
+            fixture.layout.pq_centroids_len_pos,
+            M as u64 + 1,
+        );
+        assert_corrupt_contains("pq_centroids_count_mismatch", &bytes, "codebooks, M is");
+
+        let mut bytes = fixture.bytes.clone();
+        let original = read_u64_at(&bytes, fixture.layout.coarse_n_vecs_pos);
+        write_u64_at(&mut bytes, fixture.layout.coarse_n_vecs_pos, original + 1);
+        assert_corrupt_contains(
+            "coarse_dataset_n_vecs_mismatch",
+            &bytes,
+            "values but n_vecs",
+        );
+    }
+
+    #[test]
+    fn rejects_encoder_shape_that_would_panic() {
+        let fixture = malformed_fixture();
+
+        let mut bytes = fixture.bytes.clone();
+        let original = read_u64_at(&bytes, fixture.layout.dsub_pos);
+        write_u64_at(&mut bytes, fixture.layout.dsub_pos, original + 1);
+        assert_corrupt_contains("dsub_mismatch", &bytes, "residuals.encoder: token_dim");
+    }
+
+    #[test]
+    fn rejects_cross_field_mismatches() {
+        let fixture = malformed_fixture();
+
+        let mut bytes = fixture.bytes.clone();
+        write_u32_at(
+            &mut bytes,
+            fixture.layout.residuals_data_first_pos,
+            fixture.layout.coarse_n_vecs_value as u32,
+        );
+        assert_corrupt_contains(
+            "residual_coarse_id_out_of_range",
+            &bytes,
+            "is out of range for",
+        );
+
+        let mut bytes = fixture.bytes.clone();
+        write_u32_at(
+            &mut bytes,
+            fixture.layout.inverted_lists_first_pos,
+            fixture.layout.n_docs as u32,
+        );
+        assert_corrupt_contains("posting_doc_id_out_of_range", &bytes, "but the index has");
+
+        let mut bytes = fixture.bytes.clone();
+        let second = read_u64_at(&bytes, fixture.layout.residuals_offsets_second_pos);
+        write_u64_at(
+            &mut bytes,
+            fixture.layout.residuals_offsets_second_pos,
+            second + 1,
+        );
+        assert_corrupt_contains(
+            "residual_document_span_ragged",
+            &bytes,
+            "is not divisible by encoded width",
+        );
+
+        let mut bytes = fixture.bytes.clone();
+        let mean_len = read_u64_at(&bytes, fixture.layout.dataset_mean_len_pos);
+        write_u64_at(
+            &mut bytes,
+            fixture.layout.dataset_mean_len_pos,
+            mean_len - 1,
+        );
+        assert_corrupt_contains(
+            "dataset_mean_length_mismatch",
+            &bytes,
+            "Tachiom.dataset_mean: length",
+        );
+    }
+
+    #[test]
+    fn missing_file_is_io_error() {
+        let path = temp_path("absent");
+        match Tachiom::<M>::load_index(&path) {
+            Err(IndexIoError::Io(_)) => {}
+            Err(error) => panic!("expected an Io error, got {error:?}"),
+            Ok(_) => panic!("expected load_index to fail on a missing file"),
+        }
     }
 
     #[test]
