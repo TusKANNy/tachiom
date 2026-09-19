@@ -2015,6 +2015,7 @@ name = "tachiom"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "bincode 2.0.1",
  "clap 4.6.1",
  "half",
  "kannolo",
