@@ -328,7 +328,11 @@ impl TokenAwareClustering {
         let mut sorted = results;
         sorted.sort_by_key(|(tid, _, _)| *tid);
 
-        let mut all_centroids: Vec<f16> = Vec::new();
+        let total_centroid_values = sorted
+            .iter()
+            .map(|(_, centroids, _)| centroids.values().len())
+            .sum();
+        let mut all_centroids: Vec<f16> = Vec::with_capacity(total_centroid_values);
         let mut global_assignments = vec![0u32; n_vectors];
         let mut centroid_offset = 0u32;
 
