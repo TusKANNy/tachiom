@@ -3,9 +3,10 @@
 //! Compiled when the `python` feature is enabled.  Builds a `cdylib` exposing a
 //! single `tachiom` module with one `Tachiom` class.
 
-use crate::hnsw::HNSWBuildConfiguration;
+use crate::hnsw::{HNSWBuildConfiguration, HNSWSearchConfiguration};
+use crate::kmeans::{KMeansAssign, KMeansParams, KMeansResult, train_kmeans};
 use crate::tac::{TacBuilder, TacResult};
-use crate::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
+use crate::tachiom::{Clustering, TacParams, Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::core::index::IndexStats;
 use vectorium::vector_encoder::{MultiVecEncoder, VectorEncoder};
 use vectorium::{
@@ -55,6 +56,12 @@ struct ResolvedTacParams {
     was_capped: bool,
 }
 
+/// Default centroid budget: nearest power of 2 to `n_tokens / 128`.
+fn auto_total_centroids(n_tokens: usize) -> usize {
+    let exp = (n_tokens.max(128) as f64 / 128.0).log2().round() as u32;
+    1usize << exp
+}
+
 /// Compute recommended TAC build parameters from the token-ID distribution.
 ///
 /// All `_override` arguments mirror the user-facing kwargs: `None` → auto-compute.
@@ -65,10 +72,7 @@ fn resolve_tac_params(
     small_override: Option<usize>,
 ) -> ResolvedTacParams {
     let n_tokens = token_ids.len().max(128);
-
-    // Nearest power-of-2 to n_tokens / 128.
-    let exp = (n_tokens as f64 / 128.0).log2().round() as u32;
-    let formula = 1usize << exp;
+    let formula = auto_total_centroids(n_tokens);
 
     // Thresholds: nearest power-of-2 to n_tokens^(1/4), clamped to [32, 128].
     let micro_exp = (n_tokens as f64).powf(0.25).log2().round() as u32;
@@ -182,6 +186,134 @@ fn auto_build_params(
 }
 
 // ============================================================================
+// Clustering kwargs
+// ============================================================================
+
+/// `kmeans_*` keyword arguments of `Tachiom.build*` (unprefixed on `KMeans`).
+/// `None` = default.
+#[derive(Default)]
+struct KMeansKwargs {
+    n_iter: Option<usize>,
+    points_per_centroid: Option<usize>,
+    seed: Option<u64>,
+    assign: Option<String>,
+    hnsw_m: Option<usize>,
+    hnsw_ef_construction: Option<usize>,
+    hnsw_ef_search: Option<usize>,
+}
+
+impl KMeansKwargs {
+    fn any_set(&self) -> bool {
+        self.n_iter.is_some()
+            || self.points_per_centroid.is_some()
+            || self.seed.is_some()
+            || self.assign.is_some()
+            || self.hnsw_set()
+    }
+
+    fn hnsw_set(&self) -> bool {
+        self.hnsw_m.is_some()
+            || self.hnsw_ef_construction.is_some()
+            || self.hnsw_ef_search.is_some()
+    }
+
+    fn into_params(self) -> PyResult<KMeansParams> {
+        let defaults = KMeansParams::default();
+        let assign = match self.assign.as_deref().unwrap_or("hnsw") {
+            "hnsw" => KMeansAssign::Hnsw {
+                build: HNSWBuildConfiguration::default()
+                    .with_num_neighbors(self.hnsw_m.unwrap_or(32))
+                    .with_ef_construction(self.hnsw_ef_construction.unwrap_or(200)),
+                search: HNSWSearchConfiguration::default()
+                    .with_ef_search(self.hnsw_ef_search.unwrap_or(16)),
+            },
+            "flat" if self.hnsw_set() => {
+                return Err(PyValueError::new_err(
+                    "HNSW parameters were given but the k-means assignment is \"flat\"",
+                ));
+            }
+            "flat" => KMeansAssign::Flat,
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "k-means assignment must be \"flat\" or \"hnsw\", got {other:?}"
+                )));
+            }
+        };
+        Ok(KMeansParams {
+            n_iter: self.n_iter.unwrap_or(defaults.n_iter),
+            points_per_centroid: self
+                .points_per_centroid
+                .unwrap_or(defaults.points_per_centroid),
+            seed: self.seed.unwrap_or(defaults.seed),
+            assign,
+        })
+    }
+}
+
+/// `tac_*` keyword arguments of `Tachiom.build*`.  `None` = default / auto.
+struct TacKwargs {
+    n_iter: Option<usize>,
+    micro_threshold: Option<usize>,
+    small_threshold: Option<usize>,
+}
+
+/// Turn the `clustering=` / `tac_*` / `kmeans_*` kwargs into a [`Clustering`] and
+/// the resolved centroid budget.  Arguments of the method not selected are rejected.
+fn resolve_clustering(
+    py: Python<'_>,
+    clustering: &str,
+    token_ids: Option<&[u32]>,
+    n_tokens: usize,
+    total_centroids: Option<usize>,
+    tac: TacKwargs,
+    kmeans: KMeansKwargs,
+) -> PyResult<(Clustering, usize)> {
+    let tac_set =
+        tac.n_iter.is_some() || tac.micro_threshold.is_some() || tac.small_threshold.is_some();
+    match clustering {
+        "tac" => {
+            if kmeans.any_set() {
+                return Err(PyValueError::new_err(
+                    "kmeans_* arguments require clustering=\"kmeans\"",
+                ));
+            }
+            let token_ids = token_ids.ok_or_else(|| {
+                PyValueError::new_err(
+                    "clustering=\"tac\" requires token ids; pass them or use clustering=\"kmeans\"",
+                )
+            })?;
+            let resolved = resolve_tac_params(
+                token_ids,
+                total_centroids,
+                tac.micro_threshold,
+                tac.small_threshold,
+            );
+            if resolved.was_capped {
+                warn_saturation_cap(py, total_centroids.unwrap(), resolved.sat_cap)?;
+            }
+            let params = TacParams {
+                n_iter: tac.n_iter.unwrap_or(10),
+                micro_threshold: Some(resolved.micro_threshold),
+                small_threshold: Some(resolved.small_threshold),
+            };
+            Ok((Clustering::Tac(params), resolved.total_centroids))
+        }
+        "kmeans" => {
+            if tac_set {
+                return Err(PyValueError::new_err(
+                    "tac_* arguments require clustering=\"tac\"",
+                ));
+            }
+            let total = total_centroids.unwrap_or_else(|| auto_total_centroids(n_tokens));
+            Ok((Clustering::KMeans(kmeans.into_params()?), total))
+        }
+        other => Err(PyValueError::new_err(format!(
+            "clustering must be \"tac\" or \"kmeans\", got {other:?}"
+        ))),
+    }
+}
+
+// ============================================================================
 // Module
 // ============================================================================
 
@@ -189,6 +321,7 @@ fn auto_build_params(
 fn tachiom(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTachiom>()?;
     m.add_class::<PyTac>()?;
+    m.add_class::<PyKMeans>()?;
     m.add_function(wrap_pyfunction!(auto_build_params, m)?)?;
     Ok(())
 }
@@ -214,9 +347,17 @@ impl PyTachiom {
         doclens_path,
         *,
         total_centroids = None,
+        clustering = "tac",
         tac_n_iter = None,
         tac_micro_threshold = None,
         tac_small_threshold = None,
+        kmeans_n_iter = None,
+        kmeans_points_per_centroid = None,
+        kmeans_seed = None,
+        kmeans_assign = None,
+        kmeans_hnsw_m = None,
+        kmeans_hnsw_ef_construction = None,
+        kmeans_hnsw_ef_search = None,
         pq_sample_size = None,
         pq_n_iter = None,
         normalize = None,
@@ -231,12 +372,20 @@ impl PyTachiom {
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
         vectors_path: &str,
-        token_ids_path: &str,
+        token_ids_path: Option<&str>,
         doclens_path: &str,
         total_centroids: Option<usize>,
+        clustering: &str,
         tac_n_iter: Option<usize>,
         tac_micro_threshold: Option<usize>,
         tac_small_threshold: Option<usize>,
+        kmeans_n_iter: Option<usize>,
+        kmeans_points_per_centroid: Option<usize>,
+        kmeans_seed: Option<u64>,
+        kmeans_assign: Option<String>,
+        kmeans_hnsw_m: Option<usize>,
+        kmeans_hnsw_ef_construction: Option<usize>,
+        kmeans_hnsw_ef_search: Option<usize>,
         pq_sample_size: Option<usize>,
         pq_n_iter: Option<usize>,
         normalize: Option<bool>,
@@ -247,7 +396,6 @@ impl PyTachiom {
         center_dataset: bool,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
-        let tac_n_iter = tac_n_iter.unwrap_or(10);
         let pq_sample_size = pq_sample_size.unwrap_or(10_000_000);
         let pq_n_iter = pq_n_iter.unwrap_or(10);
         let normalize = normalize.unwrap_or(true);
@@ -255,25 +403,37 @@ impl PyTachiom {
         let hnsw_m = hnsw_m.unwrap_or(32);
         let ef_construction = ef_construction.unwrap_or(1500);
         let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
-        require_min_tokens(token_ids.len())?;
+        let n_tokens = dataset.values().len() / dataset.encoder().input_dim();
+        require_min_tokens(n_tokens)?;
 
-        let token_ids_u32: Vec<u32> = token_ids.iter().map(|&x| x as u32).collect();
-        let resolved = resolve_tac_params(
-            &token_ids_u32,
+        let token_ids_u32: Option<Vec<u32>> =
+            token_ids_path.map(|_| token_ids.iter().map(|&x| x as u32).collect());
+        let (clustering, total_centroids) = resolve_clustering(
+            py,
+            clustering,
+            token_ids_u32.as_deref(),
+            n_tokens,
             total_centroids,
-            tac_micro_threshold,
-            tac_small_threshold,
-        );
-        if resolved.was_capped {
-            warn_saturation_cap(py, total_centroids.unwrap(), resolved.sat_cap)?;
-        }
+            TacKwargs {
+                n_iter: tac_n_iter,
+                micro_threshold: tac_micro_threshold,
+                small_threshold: tac_small_threshold,
+            },
+            KMeansKwargs {
+                n_iter: kmeans_n_iter,
+                points_per_centroid: kmeans_points_per_centroid,
+                seed: kmeans_seed,
+                assign: kmeans_assign,
+                hnsw_m: kmeans_hnsw_m,
+                hnsw_ef_construction: kmeans_hnsw_ef_construction,
+                hnsw_ef_search: kmeans_hnsw_ef_search,
+            },
+        )?;
 
         let params = TachiomBuildParams {
             token_ids,
-            total_centroids: resolved.total_centroids,
-            tac_n_iter,
-            tac_micro_threshold: Some(resolved.micro_threshold),
-            tac_small_threshold: Some(resolved.small_threshold),
+            total_centroids,
+            clustering,
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -302,9 +462,17 @@ impl PyTachiom {
         doclens,
         *,
         total_centroids = None,
+        clustering = "tac",
         tac_n_iter = None,
         tac_micro_threshold = None,
         tac_small_threshold = None,
+        kmeans_n_iter = None,
+        kmeans_points_per_centroid = None,
+        kmeans_seed = None,
+        kmeans_assign = None,
+        kmeans_hnsw_m = None,
+        kmeans_hnsw_ef_construction = None,
+        kmeans_hnsw_ef_search = None,
         pq_sample_size = None,
         pq_n_iter = None,
         normalize = None,
@@ -319,12 +487,20 @@ impl PyTachiom {
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
         vectors: PyReadonlyArray2<'_, u16>,
-        token_ids: PyReadonlyArray1<'_, u32>,
+        token_ids: Option<PyReadonlyArray1<'_, u32>>,
         doclens: PyReadonlyArray1<'_, i32>,
         total_centroids: Option<usize>,
+        clustering: &str,
         tac_n_iter: Option<usize>,
         tac_micro_threshold: Option<usize>,
         tac_small_threshold: Option<usize>,
+        kmeans_n_iter: Option<usize>,
+        kmeans_points_per_centroid: Option<usize>,
+        kmeans_seed: Option<u64>,
+        kmeans_assign: Option<String>,
+        kmeans_hnsw_m: Option<usize>,
+        kmeans_hnsw_ef_construction: Option<usize>,
+        kmeans_hnsw_ef_search: Option<usize>,
         pq_sample_size: Option<usize>,
         pq_n_iter: Option<usize>,
         normalize: Option<bool>,
@@ -335,35 +511,49 @@ impl PyTachiom {
         center_dataset: bool,
     ) -> PyResult<Self> {
         warn_pq_subspaces(py, pq_subspaces)?;
-        let tac_n_iter = tac_n_iter.unwrap_or(10);
         let pq_sample_size = pq_sample_size.unwrap_or(10_000_000);
         let pq_n_iter = pq_n_iter.unwrap_or(10);
         let normalize = normalize.unwrap_or(true);
         let pq_seed = pq_seed.unwrap_or(42);
         let hnsw_m = hnsw_m.unwrap_or(32);
         let ef_construction = ef_construction.unwrap_or(1500);
-        require_min_tokens(token_ids.len())?;
-        let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, &token_ids, &doclens)?;
+        let n_tokens = vectors.shape()[0];
+        require_min_tokens(n_tokens)?;
+        let (dataset, token_ids_vec) = dataset_from_arrays(&vectors, token_ids.as_ref(), &doclens)?;
 
         let ids_u32 = token_ids
-            .as_slice()
-            .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))?;
-        let resolved = resolve_tac_params(
+            .as_ref()
+            .map(|t| {
+                t.as_slice()
+                    .map_err(|_| PyValueError::new_err("token_ids must be C-contiguous"))
+            })
+            .transpose()?;
+        let (clustering, total_centroids) = resolve_clustering(
+            py,
+            clustering,
             ids_u32,
+            n_tokens,
             total_centroids,
-            tac_micro_threshold,
-            tac_small_threshold,
-        );
-        if resolved.was_capped {
-            warn_saturation_cap(py, total_centroids.unwrap(), resolved.sat_cap)?;
-        }
+            TacKwargs {
+                n_iter: tac_n_iter,
+                micro_threshold: tac_micro_threshold,
+                small_threshold: tac_small_threshold,
+            },
+            KMeansKwargs {
+                n_iter: kmeans_n_iter,
+                points_per_centroid: kmeans_points_per_centroid,
+                seed: kmeans_seed,
+                assign: kmeans_assign,
+                hnsw_m: kmeans_hnsw_m,
+                hnsw_ef_construction: kmeans_hnsw_ef_construction,
+                hnsw_ef_search: kmeans_hnsw_ef_search,
+            },
+        )?;
 
         let params = TachiomBuildParams {
             token_ids: token_ids_vec,
-            total_centroids: resolved.total_centroids,
-            tac_n_iter,
-            tac_micro_threshold: Some(resolved.micro_threshold),
-            tac_small_threshold: Some(resolved.small_threshold),
+            total_centroids,
+            clustering,
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -402,7 +592,7 @@ impl PyTachiom {
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
         vectors_path: &str,
-        token_ids_path: &str,
+        token_ids_path: Option<&str>,
         doclens_path: &str,
         centroids_path: &str,
         assignments_path: &str,
@@ -422,7 +612,7 @@ impl PyTachiom {
         let hnsw_m = hnsw_m.unwrap_or(32);
         let ef_construction = ef_construction.unwrap_or(1500);
         let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
-        let n_tokens = token_ids.len();
+        let n_tokens = dataset.values().len() / dataset.encoder().input_dim();
         require_min_tokens(n_tokens)?;
 
         let (centroids_f32, n_centroids, _dim) = read_f32_2d_npy(centroids_path)?;
@@ -433,9 +623,6 @@ impl PyTachiom {
         let params = TachiomBuildParams {
             token_ids,
             total_centroids: n_centroids, // unused by build_index_from_tac, required by struct
-            tac_n_iter: 0,                // unused
-            tac_micro_threshold: None,    // unused
-            tac_small_threshold: None,    // unused
             pq_sample_size,
             pq_n_iter,
             normalize,
@@ -444,6 +631,7 @@ impl PyTachiom {
                 .with_num_neighbors(hnsw_m)
                 .with_ef_construction(ef_construction),
             center_dataset: false, // externally-supplied centroids; caller controls preprocessing
+            ..Default::default()   // clustering: unused (already run externally)
         };
 
         let inner = py.allow_threads(|| {
@@ -932,6 +1120,130 @@ impl PyTac {
 }
 
 // ============================================================================
+// PyKMeans class
+// ============================================================================
+
+/// Standalone global k-means: the clustering step of `clustering="kmeans"`, whose
+/// output can be inspected or fed to `Tachiom.build_from_tac`.
+#[pyclass(name = "KMeans", module = "tachiom", unsendable)]
+pub struct PyKMeans {
+    n_centroids: Option<usize>,
+    params: KMeansParams,
+    result: Option<KMeansResult>,
+}
+
+impl PyKMeans {
+    fn require_trained(&self) -> PyResult<&KMeansResult> {
+        self.result.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("KMeans has not been trained yet; call train() first")
+        })
+    }
+}
+
+#[pymethods]
+impl PyKMeans {
+    #[new]
+    #[pyo3(signature = (
+        n_centroids = None,
+        *,
+        n_iter = None,
+        points_per_centroid = None,
+        seed = None,
+        assign = None,
+        hnsw_m = None,
+        hnsw_ef_construction = None,
+        hnsw_ef_search = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        n_centroids: Option<usize>,
+        n_iter: Option<usize>,
+        points_per_centroid: Option<usize>,
+        seed: Option<u64>,
+        assign: Option<String>,
+        hnsw_m: Option<usize>,
+        hnsw_ef_construction: Option<usize>,
+        hnsw_ef_search: Option<usize>,
+    ) -> PyResult<Self> {
+        let params = KMeansKwargs {
+            n_iter,
+            points_per_centroid,
+            seed,
+            assign,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_search,
+        }
+        .into_params()?;
+        Ok(PyKMeans {
+            n_centroids,
+            params,
+            result: None,
+        })
+    }
+
+    /// Run k-means on the token vectors in `vectors_path` (.npy, f16 `[N, dim]`).
+    ///
+    /// `n_centroids=None` uses the `Tachiom.build` default (nearest power of 2 to N/128).
+    /// May be called multiple times; each call overwrites the previous result.
+    fn train(&mut self, py: Python<'_>, vectors_path: &str) -> PyResult<()> {
+        let (flat_f16, dim) = read_f16_npy(vectors_path)?;
+        let k = self
+            .n_centroids
+            .unwrap_or_else(|| auto_total_centroids(flat_f16.len() / dim));
+        let params = &self.params;
+        self.result = Some(py.allow_threads(|| train_kmeans(&flat_f16, dim, k, params)));
+        Ok(())
+    }
+
+    /// Coarse centroids as f32, shape `[n_centroids, dim]`.
+    #[getter]
+    fn centroids<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray2<f32>>> {
+        let r = self.require_trained()?;
+        let f32_vec: Vec<f32> = r.centroids.iter().map(|x| x.to_f32()).collect();
+        let arr = ndarray::Array2::from_shape_vec((r.n_centroids, r.dim), f32_vec)
+            .map_err(|e| PyRuntimeError::new_err(format!("centroids reshape: {e}")))?;
+        Ok(arr.into_pyarray(py).unbind())
+    }
+
+    /// Coarse centroids as f16 (raw), shape `[n_centroids, dim]`.
+    #[getter]
+    fn centroids_f16<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray2<f16>>> {
+        let r = self.require_trained()?;
+        let arr = ndarray::Array2::from_shape_vec((r.n_centroids, r.dim), r.centroids.clone())
+            .map_err(|e| PyRuntimeError::new_err(format!("centroids_f16 reshape: {e}")))?;
+        Ok(arr.into_pyarray(py).unbind())
+    }
+
+    /// Per-token centroid assignment, shape `[n_tokens]`.
+    #[getter]
+    fn assignments<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray1<u32>>> {
+        let r = self.require_trained()?;
+        Ok(r.assignments.clone().into_pyarray(py).unbind())
+    }
+
+    /// Number of centroids produced.
+    #[getter]
+    fn n_centroids(&self) -> PyResult<usize> {
+        Ok(self.require_trained()?.n_centroids)
+    }
+
+    /// Token-vector dimensionality.
+    #[getter]
+    fn dim(&self) -> PyResult<usize> {
+        Ok(self.require_trained()?.dim)
+    }
+
+    fn __repr__(&self) -> String {
+        match (&self.result, self.n_centroids) {
+            (Some(r), _) => format!("<KMeans: n_centroids={}, dim={}>", r.n_centroids, r.dim),
+            (None, Some(k)) => format!("<KMeans: n_centroids={k}, not yet trained>"),
+            (None, None) => "<KMeans: n_centroids=auto, not yet trained>".to_string(),
+        }
+    }
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -1040,7 +1352,7 @@ fn pad_results_batch(
 /// Works transparently with memory-mapped numpy arrays.
 fn dataset_from_arrays(
     vectors: &PyReadonlyArray2<'_, u16>,
-    token_ids_arr: &PyReadonlyArray1<'_, u32>,
+    token_ids_arr: Option<&PyReadonlyArray1<'_, u32>>,
     doclens_arr: &PyReadonlyArray1<'_, i32>,
 ) -> PyResult<(TachiomInputDataset, Vec<usize>)> {
     if !vectors.is_c_contiguous() {
@@ -1060,20 +1372,25 @@ fn dataset_from_arrays(
         .map(|&bits| f16::from_bits(bits))
         .collect();
 
-    if !token_ids_arr.is_c_contiguous() {
-        return Err(PyValueError::new_err("token_ids must be C-contiguous"));
-    }
-    let token_ids_slice = token_ids_arr
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("token_ids could not be exposed as a slice"))?;
-    if token_ids_slice.len() != n_tokens {
-        return Err(PyValueError::new_err(format!(
-            "token_ids length ({}) != n_tokens ({})",
-            token_ids_slice.len(),
-            n_tokens
-        )));
-    }
-    let token_ids: Vec<usize> = token_ids_slice.iter().map(|&x| x as usize).collect();
+    let token_ids: Vec<usize> = match token_ids_arr {
+        None => Vec::new(),
+        Some(arr) => {
+            if !arr.is_c_contiguous() {
+                return Err(PyValueError::new_err("token_ids must be C-contiguous"));
+            }
+            let slice = arr
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("token_ids could not be exposed as a slice"))?;
+            if slice.len() != n_tokens {
+                return Err(PyValueError::new_err(format!(
+                    "token_ids length ({}) != n_tokens ({})",
+                    slice.len(),
+                    n_tokens
+                )));
+            }
+            slice.iter().map(|&x| x as usize).collect()
+        }
+    };
 
     if !doclens_arr.is_c_contiguous() {
         return Err(PyValueError::new_err("doclens must be C-contiguous"));
@@ -1114,17 +1431,21 @@ fn dataset_from_arrays(
 // ============================================================================
 
 /// Load vectors + token_ids + doclens, validate cross-consistency, build the
-/// `TachiomInputDataset`, and return it together with the token_ids vector.
+/// `TachiomInputDataset`, and return it together with the token_ids vector
+/// (empty when `token_ids_path` is `None`).
 fn load_input_dataset(
     vectors_path: &str,
-    token_ids_path: &str,
+    token_ids_path: Option<&str>,
     doclens_path: &str,
 ) -> PyResult<(TachiomInputDataset, Vec<usize>)> {
     let (flat_f16, dim) = read_f16_npy(vectors_path)?;
     let n_tokens = flat_f16.len() / dim;
 
-    let token_ids = read_token_ids_npy(token_ids_path)?;
-    if token_ids.len() != n_tokens {
+    let token_ids = match token_ids_path {
+        Some(path) => read_token_ids_npy(path)?,
+        None => Vec::new(),
+    };
+    if token_ids_path.is_some() && token_ids.len() != n_tokens {
         return Err(PyValueError::new_err(format!(
             "token_ids length ({}) != n_tokens ({})",
             token_ids.len(),

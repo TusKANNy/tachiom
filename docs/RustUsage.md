@@ -63,7 +63,7 @@ The filename stem encodes the run parameters for easy traceability.
 
 ## `tachiom_build` — Index Construction
 
-Runs the full pipeline (TAC → PQ training → encoding → HNSW) and saves the index to disk.
+Runs the full pipeline (clustering → PQ training → encoding → HNSW) and saves the index to disk.
 
 ```
 ./target/release/tachiom_build \
@@ -78,11 +78,19 @@ Runs the full pipeline (TAC → PQ training → encoding → HNSW) and saves the
 | Flag | Default | Description |
 |---|---|---|
 | `-i`, `--vectors-file` | *(required)* | `[N, dim]` f16 token vectors |
-| `--token-ids-file` | *(required)* | `[N]` token-type IDs (i64 or u32) |
+| `--token-ids-file` | *(required for TAC)* | `[N]` token-type IDs (i64 or u32); optional for k-means, where it only stratifies the PQ sample |
 | `--doclens-file` | *(required)* | `[n_docs]` document lengths (i32 or i64) |
 | `-o`, `--output-file` | *(required)* | Output path for the serialized index |
-| `--total-centroids` | `4194304` | TAC coarse-centroid budget |
+| `--total-centroids` | `4194304` | Coarse-centroid budget |
+| `--clustering` | `tac` | `tac` (Token-Aware Clustering) or `kmeans` (one k-means over all tokens, ignores token ids) |
 | `--tac-n-iter` | `10` | K-means iterations per token group in TAC |
+| `--kmeans-n-iter` | `10` | Lloyd iterations for k-means |
+| `--kmeans-points-per-centroid` | `64` | k-means trains on `min(N, points_per_centroid × total_centroids)` sampled tokens |
+| `--kmeans-seed` | `42` | RNG seed for k-means sampling and initialisation |
+| `--kmeans-assign` | `hnsw` | Nearest-centroid search in k-means: `hnsw` or `flat` (exact, `O(N·K·d)` per iteration) |
+| `--kmeans-hnsw-m` | `32` | HNSW M for k-means assignment |
+| `--kmeans-hnsw-ef-construction` | `200` | HNSW ef_construction for k-means assignment |
+| `--kmeans-hnsw-ef-search` | `16` | HNSW ef_search for k-means assignment |
 | `--pq-sample-size` | `10000000` | Tokens sampled for PQ training |
 | `--pq-n-iter` | `10` | K-means iterations for PQ subspace training |
 | `--normalize` | off | L2-normalise residuals before PQ encoding |
@@ -112,6 +120,9 @@ be reduced to its breakdown with `grep '\[timing\]'`:
 [timing] hnsw_centroids: 1382.69s
 [timing] inverted_lists: 25.98s
 ```
+
+With `--clustering kmeans`, the `tac.*` lines are replaced by `kmeans.sample`, `kmeans.train`
+and `kmeans.assign` (final assignment of every token).
 
 Note that `residual_encoding` covers both the residual computation and the PQ code assignment:
 they run in a single fused per-token loop and cannot be separated without instrumenting that

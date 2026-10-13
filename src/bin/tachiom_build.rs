@@ -1,12 +1,25 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use half::f16;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::time::Instant;
 
-use tachiom::hnsw::HNSWBuildConfiguration;
-use tachiom::tachiom::{Tachiom, TachiomBuildParams, TachiomInputDataset};
+use tachiom::hnsw::{HNSWBuildConfiguration, HNSWSearchConfiguration};
+use tachiom::kmeans::{KMeansAssign, KMeansParams};
+use tachiom::tachiom::{Clustering, TacParams, Tachiom, TachiomBuildParams, TachiomInputDataset};
 use vectorium::{IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum ClusteringArg {
+    Tac,
+    Kmeans,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum KMeansAssignArg {
+    Flat,
+    Hnsw,
+}
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -19,9 +32,10 @@ struct Args {
     #[clap(short = 'i', long)]
     vectors_file: String,
 
-    /// Path to the token-type ID file (.npy, dtype i64 or u32, shape [N])
+    /// Path to the token-type ID file (.npy, dtype i64 or u32, shape [N]).
+    /// Required for TAC; optional for k-means (stratifies the PQ sample when given).
     #[clap(long)]
-    token_ids_file: String,
+    token_ids_file: Option<String>,
 
     /// Path to the document-length file (.npy, shape [n_docs])
     #[clap(long)]
@@ -31,9 +45,13 @@ struct Args {
     #[clap(short = 'o', long)]
     output_file: String,
 
-    /// Total coarse-centroid budget (TAC)
+    /// Total coarse-centroid budget
     #[clap(long, default_value_t = 4_194_304)]
     total_centroids: usize,
+
+    /// Coarse-clustering method
+    #[clap(long, value_enum, default_value_t = ClusteringArg::Tac)]
+    clustering: ClusteringArg,
 
     /// K-means iterations per token type in TAC
     #[clap(long, default_value_t = 10)]
@@ -46,6 +64,34 @@ struct Args {
     /// TAC small threshold: token groups in [micro, small) get 2 centroids each
     #[clap(long, default_value_t = 256)]
     tac_small_threshold: usize,
+
+    /// Lloyd iterations for k-means
+    #[clap(long, default_value_t = 10)]
+    kmeans_n_iter: usize,
+
+    /// k-means trains on min(N, points_per_centroid × total_centroids) tokens
+    #[clap(long, default_value_t = 64)]
+    kmeans_points_per_centroid: usize,
+
+    /// RNG seed for k-means sampling and initialisation
+    #[clap(long, default_value_t = 42)]
+    kmeans_seed: u64,
+
+    /// Nearest-centroid search inside k-means
+    #[clap(long, value_enum, default_value_t = KMeansAssignArg::Hnsw)]
+    kmeans_assign: KMeansAssignArg,
+
+    /// HNSW M for k-means assignment
+    #[clap(long, default_value_t = 32)]
+    kmeans_hnsw_m: usize,
+
+    /// HNSW ef_construction for k-means assignment
+    #[clap(long, default_value_t = 200)]
+    kmeans_hnsw_ef_construction: usize,
+
+    /// HNSW ef_search for k-means assignment
+    #[clap(long, default_value_t = 16)]
+    kmeans_hnsw_ef_search: usize,
 
     /// Tokens sampled for PQ training
     #[clap(long, default_value_t = 10_000_000)]
@@ -99,11 +145,11 @@ fn main() -> anyhow::Result<()> {
 
     println!("=== Tachiom Build ===");
     println!("Vectors:         {}", args.vectors_file);
-    println!("Token IDs:       {}", args.token_ids_file);
+    println!("Token IDs:       {:?}", args.token_ids_file);
     println!("Doc lengths:     {}", args.doclens_file);
     println!("Output:          {}", args.output_file);
     println!("Total centroids: {}", args.total_centroids);
-    println!("TAC iters:       {}", args.tac_n_iter);
+    println!("Clustering:      {:?}", args.clustering);
     println!("PQ sample:       {}", args.pq_sample_size);
     println!("PQ iters:        {}", args.pq_n_iter);
     println!("Normalize:       {}", args.normalize);
@@ -127,9 +173,12 @@ fn main() -> anyhow::Result<()> {
 
     // ── Load token type IDs ───────────────────────────────────────────────────
     println!("Loading token IDs...");
-    let token_ids = read_token_ids_npy(&args.token_ids_file)?;
+    let token_ids = match &args.token_ids_file {
+        Some(path) => read_token_ids_npy(path)?,
+        None => Vec::new(),
+    };
     anyhow::ensure!(
-        token_ids.len() == n_tokens,
+        token_ids.is_empty() || token_ids.len() == n_tokens,
         "token_ids length ({}) != n_tokens ({})",
         token_ids.len(),
         n_tokens
@@ -173,13 +222,40 @@ fn main() -> anyhow::Result<()> {
     tachiom::timing::report("dataset_assembly", prep_start);
 
     // ── Build index ───────────────────────────────────────────────────────────
+    let clustering = match args.clustering {
+        ClusteringArg::Tac => {
+            anyhow::ensure!(
+                !token_ids.is_empty(),
+                "--clustering tac requires --token-ids-file"
+            );
+            Clustering::Tac(TacParams {
+                n_iter: args.tac_n_iter,
+                micro_threshold: Some(args.tac_micro_threshold),
+                small_threshold: Some(args.tac_small_threshold),
+            })
+        }
+        ClusteringArg::Kmeans => Clustering::KMeans(KMeansParams {
+            n_iter: args.kmeans_n_iter,
+            points_per_centroid: args.kmeans_points_per_centroid,
+            seed: args.kmeans_seed,
+            assign: match args.kmeans_assign {
+                KMeansAssignArg::Flat => KMeansAssign::Flat,
+                KMeansAssignArg::Hnsw => KMeansAssign::Hnsw {
+                    build: HNSWBuildConfiguration::default()
+                        .with_num_neighbors(args.kmeans_hnsw_m)
+                        .with_ef_construction(args.kmeans_hnsw_ef_construction),
+                    search: HNSWSearchConfiguration::default()
+                        .with_ef_search(args.kmeans_hnsw_ef_search),
+                },
+            },
+        }),
+    };
+
     println!("\n=== Building Tachiom index ===");
     let build_params = TachiomBuildParams {
         token_ids,
         total_centroids: args.total_centroids,
-        tac_n_iter: args.tac_n_iter,
-        tac_micro_threshold: Some(args.tac_micro_threshold),
-        tac_small_threshold: Some(args.tac_small_threshold),
+        clustering,
         pq_sample_size: args.pq_sample_size,
         pq_n_iter: args.pq_n_iter,
         normalize: args.normalize,

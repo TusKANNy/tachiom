@@ -12,6 +12,7 @@ use crate::graph::Graph;
 use crate::hnsw::{
     EarlyTerminationStrategy, HNSW, HNSWBuildConfiguration, HNSWSearchConfiguration,
 };
+use crate::kmeans::{KMeansParams, train_kmeans};
 use crate::tac::TacBuilder;
 
 use vectorium::core::dataset::ScoredVector;
@@ -278,6 +279,12 @@ impl<const M: usize> Tachiom<M> {
 
             let sample_indices: Vec<usize> = if train_n >= n_tokens {
                 (0..n_tokens).collect()
+            } else if params.token_ids.is_empty() {
+                // No token types to stratify by: uniform sample.
+                let mut rng = StdRng::seed_from_u64(42);
+                let mut out = rand::seq::index::sample(&mut rng, n_tokens, train_n).into_vec();
+                out.sort_unstable();
+                out
             } else {
                 // Group indices by token type.
                 let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -853,24 +860,20 @@ impl<const M: usize> Tachiom<M> {
 
 /// Parameters controlling how a [`Tachiom`] index is built.
 pub struct TachiomBuildParams {
-    /// Token-type IDs for TAC, one per token in dataset order.
+    /// Token-type IDs, one per token in dataset order, or empty if unavailable.
     ///
     /// `token_ids[i]` is the vocabulary / token-type id of the i-th token in
-    /// the flattened dataset (documents concatenated in order).  TAC uses these
-    /// to allocate the centroid budget proportionally across token types.
+    /// the flattened dataset (documents concatenated in order).  Required by
+    /// [`Clustering::Tac`], which allocates the centroid budget across token types.
+    /// When present, the PQ training sample is also stratified by token type;
+    /// when empty, it is sampled uniformly.
     pub token_ids: Vec<usize>,
 
     /// Total coarse-centroid budget (number of IVF clusters).
     pub total_centroids: usize,
 
-    /// K-means iterations per token type inside TAC (default: 10).
-    pub tac_n_iter: usize,
-
-    /// Token groups smaller than this receive 1 centroid each (`None` = use TAC default of 128).
-    pub tac_micro_threshold: Option<usize>,
-
-    /// Token groups in [micro, small) receive 2 centroids each (`None` = use TAC default of 256).
-    pub tac_small_threshold: Option<usize>,
+    /// How the coarse centroids are computed (default: TAC).
+    pub clustering: Clustering,
 
     /// Number of tokens sampled for PQ training.
     pub pq_sample_size: usize,
@@ -898,9 +901,7 @@ impl Default for TachiomBuildParams {
         Self {
             token_ids: Vec::new(),
             total_centroids: 4_194_304,
-            tac_n_iter: 10,
-            tac_micro_threshold: None,
-            tac_small_threshold: None,
+            clustering: Clustering::Tac(TacParams::default()),
             pq_sample_size: 10_000_000,
             pq_n_iter: 10,
             normalize: false,
@@ -909,6 +910,36 @@ impl Default for TachiomBuildParams {
                 .with_num_neighbors(32)
                 .with_ef_construction(1500),
             center_dataset: true,
+        }
+    }
+}
+
+/// Coarse-clustering method used by [`Tachiom::build_index`].
+pub enum Clustering {
+    /// Token-Aware Clustering: per-token-type k-means (needs `token_ids`).
+    Tac(TacParams),
+    /// One k-means over all token vectors, ignoring token ids.
+    KMeans(KMeansParams),
+}
+
+/// Parameters for [`Clustering::Tac`].
+pub struct TacParams {
+    /// K-means iterations per token type (default: 10).
+    pub n_iter: usize,
+
+    /// Token groups smaller than this receive 1 centroid each (`None` = use TAC default of 128).
+    pub micro_threshold: Option<usize>,
+
+    /// Token groups in [micro, small) receive 2 centroids each (`None` = use TAC default of 256).
+    pub small_threshold: Option<usize>,
+}
+
+impl Default for TacParams {
+    fn default() -> Self {
+        Self {
+            n_iter: 10,
+            micro_threshold: None,
+            small_threshold: None,
         }
     }
 }
@@ -1049,33 +1080,50 @@ impl<const M: usize> Tachiom<M> {
         };
         let flat_f16_ref: &[f16] = centered_buf.as_deref().unwrap_or(flat_f16);
 
-        // ── Step 1: Token-Aware Clustering ───────────────────────────────────
-        assert_eq!(
-            params.token_ids.len(),
-            n_tokens,
-            "token_ids length ({}) must equal n_tokens ({})",
-            params.token_ids.len(),
-            n_tokens
-        );
-        println!("[Tachiom::build_index] Step 1: Token-Aware Clustering...");
-        let mut tac_builder = TacBuilder::new().n_iter(params.tac_n_iter);
-        if let Some(v) = params.tac_micro_threshold {
-            tac_builder = tac_builder.micro_threshold(v);
-        }
-        if let Some(v) = params.tac_small_threshold {
-            tac_builder = tac_builder.small_threshold(v);
-        }
-        let tac = tac_builder.build();
-        let tac_result = tac.train(
-            flat_f16_ref,
-            token_dim,
-            &params.token_ids,
-            params.total_centroids,
-        );
-        let n_centroids = tac_result.n_centroids;
-        let assignments_usize: Vec<usize> =
-            tac_result.assignments.iter().map(|&x| x as usize).collect();
-        let centroids_f16 = tac_result.centroids;
+        // ── Step 1: Coarse clustering ────────────────────────────────────────
+        let (centroids_f16, n_centroids, assignments) = match &params.clustering {
+            Clustering::Tac(tac_params) => {
+                assert_eq!(
+                    params.token_ids.len(),
+                    n_tokens,
+                    "token_ids length ({}) must equal n_tokens ({})",
+                    params.token_ids.len(),
+                    n_tokens
+                );
+                println!("[Tachiom::build_index] Step 1: Token-Aware Clustering...");
+                let mut tac_builder = TacBuilder::new().n_iter(tac_params.n_iter);
+                if let Some(v) = tac_params.micro_threshold {
+                    tac_builder = tac_builder.micro_threshold(v);
+                }
+                if let Some(v) = tac_params.small_threshold {
+                    tac_builder = tac_builder.small_threshold(v);
+                }
+                let r = tac_builder.build().train(
+                    flat_f16_ref,
+                    token_dim,
+                    &params.token_ids,
+                    params.total_centroids,
+                );
+                (r.centroids, r.n_centroids, r.assignments)
+            }
+            Clustering::KMeans(kmeans_params) => {
+                assert!(
+                    params.token_ids.is_empty() || params.token_ids.len() == n_tokens,
+                    "token_ids length ({}) must be 0 or n_tokens ({})",
+                    params.token_ids.len(),
+                    n_tokens
+                );
+                println!("[Tachiom::build_index] Step 1: k-means clustering...");
+                let r = train_kmeans(
+                    flat_f16_ref,
+                    token_dim,
+                    params.total_centroids,
+                    kmeans_params,
+                );
+                (r.centroids, r.n_centroids, r.assignments)
+            }
+        };
+        let assignments_usize: Vec<usize> = assignments.iter().map(|&x| x as usize).collect();
 
         // ── Steps 2–6: PQ training, encoding, HNSW, inverted lists ──────────────
         let mut tachiom = Self::build_from_tac_parts(
