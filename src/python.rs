@@ -335,6 +335,73 @@ pub struct PyTachiom {
     inner: Tachiom<M_FIXED>,
 }
 
+impl PyTachiom {
+    /// Shared body of `build_from_centroids{,_arrays}`: validate, then build.
+    #[allow(clippy::too_many_arguments)]
+    fn from_centroids_impl(
+        py: Python<'_>,
+        dataset: TachiomInputDataset,
+        token_ids: Vec<usize>,
+        centroids_f32: &[f32],
+        n_centroids: usize,
+        centroid_dim: usize,
+        assignments: Vec<usize>,
+        pq_sample_size: Option<usize>,
+        pq_n_iter: Option<usize>,
+        normalize: Option<bool>,
+        pq_seed: Option<u64>,
+        hnsw_m: Option<usize>,
+        ef_construction: Option<usize>,
+        pq_subspaces: usize,
+        center_dataset: bool,
+    ) -> PyResult<Self> {
+        warn_pq_subspaces(py, pq_subspaces)?;
+        let dim = dataset.encoder().input_dim();
+        let n_tokens = dataset.values().len() / dim;
+        require_min_tokens(n_tokens)?;
+        if n_centroids == 0 || centroid_dim != dim {
+            return Err(PyValueError::new_err(format!(
+                "centroids must have shape (n_centroids > 0, {dim}); got ({n_centroids}, {centroid_dim})"
+            )));
+        }
+        if assignments.len() != n_tokens {
+            return Err(PyValueError::new_err(format!(
+                "assignments length ({}) != n_tokens ({n_tokens})",
+                assignments.len()
+            )));
+        }
+        if let Some(&bad) = assignments.iter().find(|&&a| a >= n_centroids) {
+            return Err(PyValueError::new_err(format!(
+                "assignments must be < n_centroids ({n_centroids}); found {bad}"
+            )));
+        }
+        let params = TachiomBuildParams {
+            token_ids,
+            total_centroids: n_centroids, // unused by build_index_from_centroids, required by struct
+            pq_sample_size: pq_sample_size.unwrap_or(10_000_000),
+            pq_n_iter: pq_n_iter.unwrap_or(10),
+            normalize: normalize.unwrap_or(true),
+            pq_seed: Some(pq_seed.unwrap_or(42)),
+            hnsw_params: HNSWBuildConfiguration::default()
+                .with_num_neighbors(hnsw_m.unwrap_or(32))
+                .with_ef_construction(ef_construction.unwrap_or(1500)),
+            center_dataset,
+            ..Default::default() // clustering: unused (already run externally)
+        };
+
+        let inner = py.allow_threads(|| {
+            Tachiom::<M_FIXED>::build_index_from_centroids(
+                centroids_f32,
+                n_centroids,
+                assignments,
+                dataset,
+                &params,
+            )
+        });
+        Ok(PyTachiom { inner })
+    }
+}
+
 #[pymethods]
 impl PyTachiom {
     // ── Constructors ─────────────────────────────────────────────────────────
@@ -568,9 +635,8 @@ impl PyTachiom {
         Ok(PyTachiom { inner })
     }
 
-    /// Build a Tachiom index using pre-computed coarse centroids and assignments.
-    /// Skips the TAC step.  Useful for isolating retrieval differences between
-    /// clustering and residual encoding.
+    /// Build a Tachiom index from externally computed coarse centroids and assignments
+    /// (.npy files).  Skips clustering; see `build_from_centroids_arrays`.
     #[classmethod]
     #[pyo3(signature = (
         vectors_path,
@@ -586,9 +652,10 @@ impl PyTachiom {
         hnsw_m = None,
         ef_construction = None,
         pq_subspaces = 32,
+        center_dataset = true,
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn build_from_tac(
+    fn build_from_centroids(
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
         vectors_path: &str,
@@ -603,47 +670,98 @@ impl PyTachiom {
         hnsw_m: Option<usize>,
         ef_construction: Option<usize>,
         pq_subspaces: usize,
+        center_dataset: bool,
     ) -> PyResult<Self> {
-        warn_pq_subspaces(py, pq_subspaces)?;
-        let pq_sample_size = pq_sample_size.unwrap_or(10_000_000);
-        let pq_n_iter = pq_n_iter.unwrap_or(10);
-        let normalize = normalize.unwrap_or(true);
-        let pq_seed = pq_seed.unwrap_or(42);
-        let hnsw_m = hnsw_m.unwrap_or(32);
-        let ef_construction = ef_construction.unwrap_or(1500);
         let (dataset, token_ids) = load_input_dataset(vectors_path, token_ids_path, doclens_path)?;
         let n_tokens = dataset.values().len() / dataset.encoder().input_dim();
-        require_min_tokens(n_tokens)?;
-
-        let (centroids_f32, n_centroids, _dim) = read_f32_2d_npy(centroids_path)?;
-        let centroids_f16: Vec<f16> = centroids_f32.iter().map(|&x| f16::from_f32(x)).collect();
-
+        let (centroids_f32, n_centroids, centroid_dim) = read_f32_2d_npy(centroids_path)?;
         let assignments = read_assignments_npy(assignments_path, n_tokens)?;
-
-        let params = TachiomBuildParams {
+        Self::from_centroids_impl(
+            py,
+            dataset,
             token_ids,
-            total_centroids: n_centroids, // unused by build_index_from_tac, required by struct
+            &centroids_f32,
+            n_centroids,
+            centroid_dim,
+            assignments,
             pq_sample_size,
             pq_n_iter,
             normalize,
-            pq_seed: Some(pq_seed),
-            hnsw_params: HNSWBuildConfiguration::default()
-                .with_num_neighbors(hnsw_m)
-                .with_ef_construction(ef_construction),
-            center_dataset: false, // externally-supplied centroids; caller controls preprocessing
-            ..Default::default()   // clustering: unused (already run externally)
-        };
+            pq_seed,
+            hnsw_m,
+            ef_construction,
+            pq_subspaces,
+            center_dataset,
+        )
+    }
 
-        let inner = py.allow_threads(|| {
-            Tachiom::<M_FIXED>::build_index_from_tac(
-                centroids_f16,
-                n_centroids,
-                assignments,
-                dataset,
-                &params,
-            )
-        });
-        Ok(PyTachiom { inner })
+    /// Build a Tachiom index from externally computed coarse centroids and assignments
+    /// (in-memory numpy arrays), e.g. the output of `Tac`, `KMeans` or a GPU k-means.
+    /// Skips clustering.
+    #[classmethod]
+    #[pyo3(signature = (
+        vectors,
+        token_ids,
+        doclens,
+        centroids,
+        assignments,
+        *,
+        pq_sample_size = None,
+        pq_n_iter = None,
+        normalize = None,
+        pq_seed = None,
+        hnsw_m = None,
+        ef_construction = None,
+        pq_subspaces = 32,
+        center_dataset = true,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn build_from_centroids_arrays(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        vectors: PyReadonlyArray2<'_, u16>,
+        token_ids: Option<PyReadonlyArray1<'_, u32>>,
+        doclens: PyReadonlyArray1<'_, i32>,
+        centroids: PyReadonlyArray2<'_, f32>,
+        assignments: PyReadonlyArray1<'_, u32>,
+        pq_sample_size: Option<usize>,
+        pq_n_iter: Option<usize>,
+        normalize: Option<bool>,
+        pq_seed: Option<u64>,
+        hnsw_m: Option<usize>,
+        ef_construction: Option<usize>,
+        pq_subspaces: usize,
+        center_dataset: bool,
+    ) -> PyResult<Self> {
+        let (dataset, token_ids) = dataset_from_arrays(&vectors, token_ids.as_ref(), &doclens)?;
+        let shape = centroids.shape();
+        let (n_centroids, centroid_dim) = (shape[0], shape[1]);
+        let centroids_f32 = centroids
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("centroids must be C-contiguous"))?;
+        let assignments: Vec<usize> = assignments
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("assignments must be C-contiguous"))?
+            .iter()
+            .map(|&a| a as usize)
+            .collect();
+        Self::from_centroids_impl(
+            py,
+            dataset,
+            token_ids,
+            centroids_f32,
+            n_centroids,
+            centroid_dim,
+            assignments,
+            pq_sample_size,
+            pq_n_iter,
+            normalize,
+            pq_seed,
+            hnsw_m,
+            ef_construction,
+            pq_subspaces,
+            center_dataset,
+        )
     }
 
     /// Load a previously-saved Tachiom index from disk.
@@ -1124,7 +1242,7 @@ impl PyTac {
 // ============================================================================
 
 /// Standalone global k-means: the clustering step of `clustering="kmeans"`, whose
-/// output can be inspected or fed to `Tachiom.build_from_tac`.
+/// output can be inspected or fed to `Tachiom.build_from_centroids`.
 #[pyclass(name = "KMeans", module = "tachiom", unsendable)]
 pub struct PyKMeans {
     n_centroids: Option<usize>,

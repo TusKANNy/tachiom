@@ -25,7 +25,7 @@ class Tac:
         tac.train("vectors.npy", "token_ids.npy")
 
         # Feed directly into Tachiom (no temp files needed)
-        index = Tachiom.build_from_tac(
+        index = Tachiom.build_from_centroids(
             "vectors.npy", "token_ids.npy", "doclens.npy",
             centroids_path=..., assignments_path=...,
         )
@@ -108,7 +108,7 @@ class KMeans:
         km.train("vectors.npy")
         np.save("centroids.npy", km.centroids)
         np.save("assignments.npy", km.assignments)
-        index = Tachiom.build_from_tac(
+        index = Tachiom.build_from_centroids(
             "vectors.npy", None, "doclens.npy", "centroids.npy", "assignments.npy",
         )
     """
@@ -292,7 +292,7 @@ class Tachiom:
         ...
 
     @classmethod
-    def build_from_tac(
+    def build_from_centroids(
         cls,
         vectors_path: str,
         token_ids_path: str | None,
@@ -307,18 +307,56 @@ class Tachiom:
         hnsw_m: int | None = None,
         ef_construction: int | None = None,
         pq_subspaces: int = 32,
+        center_dataset: bool = True,
     ) -> Tachiom:
-        """Build an index using pre-computed coarse centroids and assignments.
+        """Build an index from externally computed coarse centroids and assignments.
 
-        Skips clustering (e.g. output of ``Tac`` or ``KMeans``) and runs PQ
-        training + encoding from scratch.  ``token_ids_path`` may be None, in
-        which case the PQ training sample is drawn uniformly.  Useful for isolating retrieval differences between the
-        clustering step and the residual/PQ encoding step.
-        All keyword arguments default to None — see build() for the resolved defaults.
+        Skips clustering (e.g. output of ``Tac``, ``KMeans``, or any other k-means)
+        and runs PQ training + encoding from scratch.  ``token_ids_path`` may be
+        None, in which case the PQ training sample is drawn uniformly.
+
+        Centroids must live in the same space as the input vectors (i.e. computed
+        on the raw, uncentered vectors).  With ``center_dataset=True`` (default,
+        as in ``build()``), the vectors and the centroids are both shifted by the
+        dataset mean, which leaves the assignments valid.
+        All other keyword arguments default to None — see build() for the resolved defaults.
 
         Args:
             centroids_path:   .npy file, [K, dim] f32 coarse centroids.
-            assignments_path: .npy file, [N] u32/u64 centroid id per token.
+            assignments_path: .npy file, [N] u32/u64 centroid id per token (< K).
+
+        Raises:
+            ValueError: on a centroid dim mismatch, a wrong assignments length, or
+                an assignment >= K.
+        """
+        ...
+
+    @classmethod
+    def build_from_centroids_arrays(
+        cls,
+        vectors: NDArray[np.uint16],
+        token_ids: NDArray[np.uint32] | None,
+        doclens: NDArray[np.int32],
+        centroids: NDArray[np.float32],
+        assignments: NDArray[np.uint32],
+        *,
+        pq_sample_size: int | None = None,
+        pq_n_iter: int | None = None,
+        normalize: bool | None = None,
+        pq_seed: int | None = None,
+        hnsw_m: int | None = None,
+        ef_construction: int | None = None,
+        pq_subspaces: int = 32,
+        center_dataset: bool = True,
+    ) -> Tachiom:
+        """In-memory variant of build_from_centroids().
+
+        Args:
+            vectors:     [N, dim] uint16 (f16 bit patterns), C-contiguous; as build_from_arrays().
+            token_ids:   [N] u32, or None.
+            doclens:     [n_docs] i32.
+            centroids:   [K, dim] f32, C-contiguous.
+            assignments: [N] u32, centroid id per token (< K).
         """
         ...
 

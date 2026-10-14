@@ -62,6 +62,11 @@ struct Args {
     /// HNSW ef_construction
     #[clap(long, default_value_t = 1500)]
     ef_construction: usize,
+
+    /// Subtract the dataset mean from the token vectors and the centroids before building
+    /// (as tachiom_build does). Pass --center-dataset false to disable.
+    #[clap(long, action = clap::ArgAction::Set, default_value_t = true)]
+    center_dataset: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -112,7 +117,7 @@ fn main() -> anyhow::Result<()> {
     );
     println!("  {} docs, {} tokens total", n_docs, n_tokens);
 
-    // ── Load coarse centroids (f32 → f16) ────────────────────────────────────
+    // ── Load coarse centroids (f32) ──────────────────────────────────────────
     println!("Loading coarse centroids...");
     let (centroids_f32, n_centroids, token_dim) = read_f32_2d_npy(&args.centroids_file)?;
     anyhow::ensure!(
@@ -122,7 +127,6 @@ fn main() -> anyhow::Result<()> {
         dim
     );
     println!("  {} centroids × dim={}", n_centroids, token_dim);
-    let centroids_f16: Vec<f16> = centroids_f32.iter().map(|&x| f16::from_f32(x)).collect();
 
     // ── Load assignments ([N] u64 or u32) ─────────────────────────────────────
     println!("Loading assignments...");
@@ -152,7 +156,7 @@ fn main() -> anyhow::Result<()> {
     println!("\n=== Building Tachiom index (from TAC output) ===");
     let params = TachiomBuildParams {
         token_ids,
-        total_centroids: n_centroids, // unused by build_index_from_tac, but required by the struct
+        total_centroids: n_centroids, // unused by build_index_from_centroids, but required by the struct
         pq_sample_size: args.pq_sample_size,
         pq_n_iter: args.pq_n_iter,
         normalize: args.normalize,
@@ -160,13 +164,13 @@ fn main() -> anyhow::Result<()> {
         hnsw_params: HNSWBuildConfiguration::default()
             .with_num_neighbors(args.hnsw_m)
             .with_ef_construction(args.ef_construction),
-        center_dataset: false, // externally-supplied centroids; caller controls preprocessing
-        ..Default::default()   // clustering: unused (already run externally)
+        center_dataset: args.center_dataset,
+        ..Default::default() // clustering: unused (already run externally)
     };
 
     let build_start = Instant::now();
-    let index = Tachiom::<32>::build_index_from_tac(
-        centroids_f16,
+    let index = Tachiom::<32>::build_index_from_centroids(
+        &centroids_f32,
         n_centroids,
         assignments,
         dataset,

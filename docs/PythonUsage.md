@@ -101,15 +101,17 @@ block-buffers. Run with `python -u` (or `print(..., flush=True)`) if interleaved
 
 #### From pre-computed clustering output
 
-If you have already run `Tac` or `KMeans` (e.g. to inspect centroids or tune the centroid budget separately), skip the clustering step. `token_ids_path` may be `None`:
+If you have already clustered the vectors — with `Tac`, `KMeans`, or any other implementation such
+as a GPU k-means — skip the clustering step. `token_ids_path` may be `None`:
 
 ```python
-index = tachiom.Tachiom.build_from_tac(
+index = tachiom.Tachiom.build_from_centroids(
     vectors_path,
-    token_ids_path,
+    token_ids_path,    # or None
     doclens_path,
     centroids_path,    # [K, dim] f32 .npy
-    assignments_path,  # [N]      u32 .npy
+    assignments_path,  # [N]      u32 .npy, values < K
+    center_dataset=True,  # as in build(): shift vectors and centroids by the dataset mean
     pq_sample_size=10_000_000,
     pq_n_iter=10,
     normalize=True,
@@ -118,7 +120,16 @@ index = tachiom.Tachiom.build_from_tac(
     ef_construction=1500,
     pq_subspaces=32,
 )
+
+# Same, from in-memory arrays (vectors as uint16 f16 bit patterns, like build_from_arrays):
+index = tachiom.Tachiom.build_from_centroids_arrays(
+    vectors_u16, token_ids_or_none, doclens, centroids_f32, assignments_u32,
+)
 ```
+
+Centroids must be computed on the raw (uncentered) vectors. With `center_dataset=True` (the
+default), both are shifted by the dataset mean before building, so the result matches what
+`build()` produces from the same clustering.
 
 ### Saving and loading
 
@@ -226,7 +237,7 @@ import numpy as np
 np.save("centroids.npy",   tac.centroids)
 np.save("assignments.npy", tac.assignments)
 
-index = tachiom.Tachiom.build_from_tac(
+index = tachiom.Tachiom.build_from_centroids(
     "vectors.npy", "token_ids.npy", "doclens.npy",
     "centroids.npy", "assignments.npy",
 )
@@ -254,7 +265,7 @@ km.centroids, km.centroids_f16, km.assignments, km.n_centroids, km.dim
 
 np.save("centroids.npy",   km.centroids)
 np.save("assignments.npy", km.assignments)
-index = tachiom.Tachiom.build_from_tac(
+index = tachiom.Tachiom.build_from_centroids(
     "vectors.npy", None, "doclens.npy", "centroids.npy", "assignments.npy",
 )
 ```

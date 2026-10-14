@@ -199,6 +199,46 @@ fn build_inverted_lists(
     (inverted_lists, offsets)
 }
 
+/// Subtract the per-dimension mean from every token vector.
+///
+/// Returns the centered vectors and the mean.  Scores against the centered data shift by
+/// `-<mean, query>` (the same constant for every document), so rankings are unchanged.
+fn center_tokens(flat_f16: &[f16], token_dim: usize) -> (Vec<f16>, Box<[f32]>) {
+    use rayon::prelude::*;
+    let center_start = Instant::now();
+    let mean_f64: Vec<f64> = flat_f16
+        .par_chunks_exact(token_dim)
+        .fold(
+            || vec![0.0f64; token_dim],
+            |mut acc, chunk| {
+                acc.iter_mut()
+                    .zip(chunk)
+                    .for_each(|(a, &v)| *a += v.to_f32() as f64);
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0f64; token_dim],
+            |mut a, b| {
+                a.iter_mut().zip(&b).for_each(|(x, y)| *x += y);
+                a
+            },
+        );
+    let n = (flat_f16.len() / token_dim) as f64;
+    let mean_f32: Box<[f32]> = mean_f64.iter().map(|&m| (m / n) as f32).collect();
+    let centered: Vec<f16> = flat_f16
+        .par_chunks_exact(token_dim)
+        .flat_map_iter(|chunk| {
+            chunk
+                .iter()
+                .zip(mean_f32.iter())
+                .map(|(&v, &m)| f16::from_f32(v.to_f32() - m))
+        })
+        .collect();
+    crate::timing::report("center_dataset", center_start);
+    (centered, mean_f32)
+}
+
 impl<const M: usize> Tachiom<M> {
     /// Build an IVF index from centroids HNSW and token->centroid `assignments`.
     ///
@@ -245,11 +285,11 @@ impl<const M: usize> Tachiom<M> {
         }
     }
 
-    /// Core build pipeline starting from pre-computed TAC output (steps 2–6).
+    /// Core build pipeline starting from coarse centroids and assignments (steps 2–6).
     ///
     /// Runs PQ sample selection, encoder training, document encoding, HNSW construction,
-    /// and inverted-list assembly.  Called by both `build_index` (after TAC) and
-    /// `build_index_from_tac` (with externally supplied centroids/assignments).
+    /// and inverted-list assembly.  Called by both `build_index` (after clustering) and
+    /// `build_index_from_centroids` (with externally supplied centroids/assignments).
     fn build_from_tac_parts(
         centroids_f16: Vec<f16>,
         n_centroids: usize,
@@ -526,14 +566,20 @@ impl<const M: usize> Tachiom<M> {
         )
     }
 
-    /// Build a Tachiom index from pre-computed TAC coarse centroids and assignments.
+    /// Build a Tachiom index from externally computed coarse centroids and assignments.
     ///
-    /// Skips Token-Aware Clustering and runs PQ training, encoding, HNSW construction,
-    /// and inverted-list assembly using the supplied centroids and assignments.
-    /// Useful for isolating whether retrieval differences stem from the clustering step
-    /// or the residual/PQ encoding step.
-    pub fn build_index_from_tac(
-        centroids_f16: Vec<f16>,
+    /// Skips clustering and runs PQ training, encoding, HNSW construction, and inverted-list
+    /// assembly using the supplied f32 centroids (`n_centroids × dim`, in the same space as
+    /// the input vectors) and per-token assignments.  Centroids are stored as f16 after
+    /// centering, so they are rounded once.  With `params.center_dataset`, the vectors
+    /// and the centroids are both shifted by the dataset mean, which leaves k-means-style
+    /// assignments valid and matches what [`build_index`](Self::build_index) does.
+    ///
+    /// # Panics
+    /// Panics if the centroid buffer is not `n_centroids × dim`, if `assignments` does not
+    /// have one entry per token, or if an assignment is `>= n_centroids`.
+    pub fn build_index_from_centroids(
+        centroids_f32: &[f32],
         n_centroids: usize,
         assignments_usize: Vec<usize>,
         dataset: TachiomInputDataset,
@@ -541,29 +587,66 @@ impl<const M: usize> Tachiom<M> {
     ) -> Self {
         let token_dim = dataset.encoder().input_dim();
         let flat_f16: &[f16] = dataset.values();
+        let n_tokens = flat_f16.len() / token_dim;
         let doc_token_counts: Vec<usize> = dataset
             .offsets()
             .windows(2)
             .map(|w| (w[1] - w[0]) / token_dim)
             .collect();
 
+        assert_eq!(
+            centroids_f32.len(),
+            n_centroids * token_dim,
+            "centroids must be n_centroids ({n_centroids}) × dim ({token_dim})"
+        );
+        assert_eq!(
+            assignments_usize.len(),
+            n_tokens,
+            "assignments length ({}) must equal n_tokens ({n_tokens})",
+            assignments_usize.len()
+        );
+        assert!(
+            assignments_usize.iter().all(|&a| a < n_centroids),
+            "assignments must be < n_centroids ({n_centroids})"
+        );
+
         println!(
-            "[Tachiom::build_index_from_tac] {} docs, {} tokens, dim={}, {} centroids",
+            "[Tachiom::build_index_from_centroids] {} docs, {} tokens, dim={}, {} centroids",
             doc_token_counts.len(),
-            flat_f16.len() / token_dim,
+            n_tokens,
             token_dim,
             n_centroids
         );
 
-        Self::build_from_tac_parts(
+        let (centered_buf, dataset_mean) = if params.center_dataset {
+            let (centered, mean) = center_tokens(flat_f16, token_dim);
+            (Some(centered), Some(mean))
+        } else {
+            (None, None)
+        };
+        let centroids_f16: Vec<f16> = match &dataset_mean {
+            Some(mean) => centroids_f32
+                .chunks_exact(token_dim)
+                .flat_map(|c| {
+                    c.iter()
+                        .zip(mean.iter())
+                        .map(|(&v, &m)| f16::from_f32(v - m))
+                })
+                .collect(),
+            None => centroids_f32.iter().map(|&v| f16::from_f32(v)).collect(),
+        };
+
+        let mut tachiom = Self::build_from_tac_parts(
             centroids_f16,
             n_centroids,
             assignments_usize,
-            flat_f16,
+            centered_buf.as_deref().unwrap_or(flat_f16),
             token_dim,
             &doc_token_counts,
             params,
-        )
+        );
+        tachiom.dataset_mean = dataset_mean;
+        tachiom
     }
 
     /// Stage 1: accumulate per-doc coarse scores across all query tokens.
@@ -1041,40 +1124,9 @@ impl<const M: usize> Tachiom<M> {
         // ── Optional: mean-center the dataset ────────────────────────────────
         // Scores shift by -<mean, query> (same constant for every doc), so rankings are unchanged.
         let (centered_buf, dataset_mean) = if params.center_dataset {
-            use rayon::prelude::*;
             println!("[Tachiom::build_index] Computing dataset mean for centering...");
-            let center_start = Instant::now();
-            let mean_f64: Vec<f64> = flat_f16
-                .par_chunks_exact(token_dim)
-                .fold(
-                    || vec![0.0f64; token_dim],
-                    |mut acc, chunk| {
-                        acc.iter_mut()
-                            .zip(chunk)
-                            .for_each(|(a, &v)| *a += v.to_f32() as f64);
-                        acc
-                    },
-                )
-                .reduce(
-                    || vec![0.0f64; token_dim],
-                    |mut a, b| {
-                        a.iter_mut().zip(&b).for_each(|(x, y)| *x += y);
-                        a
-                    },
-                );
-            let n = n_tokens as f64;
-            let mean_f32: Box<[f32]> = mean_f64.iter().map(|&m| (m / n) as f32).collect();
-            let centered: Vec<f16> = flat_f16
-                .par_chunks_exact(token_dim)
-                .flat_map_iter(|chunk| {
-                    chunk
-                        .iter()
-                        .zip(mean_f32.iter())
-                        .map(|(&v, &m)| f16::from_f32(v.to_f32() - m))
-                })
-                .collect();
-            crate::timing::report("center_dataset", center_start);
-            (Some(centered), Some(mean_f32))
+            let (centered, mean) = center_tokens(flat_f16, token_dim);
+            (Some(centered), Some(mean))
         } else {
             (None, None)
         };
