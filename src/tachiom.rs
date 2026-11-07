@@ -25,7 +25,7 @@ use vectorium::{
 
 // Type aliases for better readability
 type CentroidDataset = DenseDataset<PlainDenseQuantizer<f16, DotProduct>>;
-type HNSWCentroids = HNSW<CentroidDataset, Graph>;
+pub(crate) type HNSWCentroids = HNSW<CentroidDataset, Graph>;
 type ResidualDataset<const M: usize> = MultiVectorDataset<MultiVecTwoLevelProductQuantizer<M, f16>>;
 
 /// Min-heap wrapper for maintaining top-k scores (smaller = evicted first).
@@ -1122,7 +1122,11 @@ impl<const M: usize> Index for Tachiom<M> {
     }
 }
 
-impl<const M: usize> IndexSerializer for Tachiom<M> {}
+impl<const M: usize> IndexSerializer for Tachiom<M> {
+    fn load_index(filename: &str) -> Result<Self, vectorium::IndexIoError> {
+        crate::fast_load::load_index::<M>(filename)
+    }
+}
 
 #[cfg(test)]
 mod tests {
