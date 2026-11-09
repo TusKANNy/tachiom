@@ -10,18 +10,20 @@ use vectorium::{IndexSerializer, MultiVectorDataset, PlainMultiVecQuantizer};
 
 #[derive(Parser, Debug)]
 #[clap(
-    about = "Build a Tachiom index from pre-built TAC output (coarse centroids + assignments).\n\
-                Skips Token-Aware Clustering and runs PQ training + encoding from scratch,\n\
-                letting you isolate whether quality differences come from clustering or residuals."
+    about = "Build a Tachiom index from precomputed coarse centroids + assignments.\n\
+                Skips clustering (TAC, k-means, or any external implementation such as a GPU\n\
+                k-means) and runs PQ training + encoding from scratch, letting you isolate\n\
+                whether quality differences come from clustering or residuals."
 )]
 struct Args {
     /// [N, dim] f16 token-vector file (.npy)
     #[clap(short = 'i', long)]
     vectors_file: String,
 
-    /// [N] token-type ID file (.npy, i64 or u32) — used for damped PQ sample selection
+    /// [N] token-type ID file (.npy, i64 or u32), optional. When given, the PQ
+    /// training sample is stratified by token type; otherwise it is uniform.
     #[clap(long)]
-    token_ids_file: String,
+    token_ids_file: Option<String>,
 
     /// [n_docs] document-length file (.npy)
     #[clap(long)]
@@ -72,9 +74,9 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    println!("=== Tachiom Build From TAC ===");
+    println!("=== Tachiom Build From Centroids ===");
     println!("Vectors:        {}", args.vectors_file);
-    println!("Token IDs:      {}", args.token_ids_file);
+    println!("Token IDs:      {:?}", args.token_ids_file);
     println!("Doc lengths:    {}", args.doclens_file);
     println!("Centroids:      {}", args.centroids_file);
     println!("Assignments:    {}", args.assignments_file);
@@ -95,10 +97,15 @@ fn main() -> anyhow::Result<()> {
     println!("  {} tokens × dim={}", n_tokens, dim);
 
     // ── Load token type IDs ───────────────────────────────────────────────────
-    println!("Loading token IDs...");
-    let token_ids = read_token_ids_npy(&args.token_ids_file)?;
+    let token_ids = match &args.token_ids_file {
+        Some(path) => {
+            println!("Loading token IDs...");
+            read_token_ids_npy(path)?
+        }
+        None => Vec::new(),
+    };
     anyhow::ensure!(
-        token_ids.len() == n_tokens,
+        token_ids.is_empty() || token_ids.len() == n_tokens,
         "token_ids length ({}) != n_tokens ({})",
         token_ids.len(),
         n_tokens
@@ -152,8 +159,8 @@ fn main() -> anyhow::Result<()> {
         encoder,
     );
 
-    // ── Build index from TAC output ───────────────────────────────────────────
-    println!("\n=== Building Tachiom index (from TAC output) ===");
+    // ── Build index from precomputed clustering ───────────────────────────────
+    println!("\n=== Building Tachiom index (from precomputed centroids) ===");
     let params = TachiomBuildParams {
         token_ids,
         total_centroids: n_centroids, // unused by build_index_from_centroids, but required by the struct

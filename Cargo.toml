@@ -33,8 +33,8 @@ path = "src/bin/tachiom_build.rs"
 required-features = ["cli"]
 
 [[bin]]
-name = "tachiom_build_from_tac"
-path = "src/bin/tachiom_build_from_tac.rs"
+name = "tachiom_build_from_centroids"
+path = "src/bin/tachiom_build_from_centroids.rs"
 required-features = ["cli"]
 
 [[bin]]
