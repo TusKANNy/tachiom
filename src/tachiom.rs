@@ -12,6 +12,7 @@ use crate::graph::Graph;
 use crate::hnsw::{
     EarlyTerminationStrategy, HNSW, HNSWBuildConfiguration, HNSWSearchConfiguration,
 };
+use crate::kmeans::{KMeansParams, train_kmeans};
 use crate::tac::TacBuilder;
 
 use vectorium::core::dataset::ScoredVector;
@@ -198,6 +199,46 @@ fn build_inverted_lists(
     (inverted_lists, offsets)
 }
 
+/// Subtract the per-dimension mean from every token vector.
+///
+/// Returns the centered vectors and the mean.  Scores against the centered data shift by
+/// `-<mean, query>` (the same constant for every document), so rankings are unchanged.
+fn center_tokens(flat_f16: &[f16], token_dim: usize) -> (Vec<f16>, Box<[f32]>) {
+    use rayon::prelude::*;
+    let center_start = Instant::now();
+    let mean_f64: Vec<f64> = flat_f16
+        .par_chunks_exact(token_dim)
+        .fold(
+            || vec![0.0f64; token_dim],
+            |mut acc, chunk| {
+                acc.iter_mut()
+                    .zip(chunk)
+                    .for_each(|(a, &v)| *a += v.to_f32() as f64);
+                acc
+            },
+        )
+        .reduce(
+            || vec![0.0f64; token_dim],
+            |mut a, b| {
+                a.iter_mut().zip(&b).for_each(|(x, y)| *x += y);
+                a
+            },
+        );
+    let n = (flat_f16.len() / token_dim) as f64;
+    let mean_f32: Box<[f32]> = mean_f64.iter().map(|&m| (m / n) as f32).collect();
+    let centered: Vec<f16> = flat_f16
+        .par_chunks_exact(token_dim)
+        .flat_map_iter(|chunk| {
+            chunk
+                .iter()
+                .zip(mean_f32.iter())
+                .map(|(&v, &m)| f16::from_f32(v.to_f32() - m))
+        })
+        .collect();
+    crate::timing::report("center_dataset", center_start);
+    (centered, mean_f32)
+}
+
 impl<const M: usize> Tachiom<M> {
     /// Build an IVF index from centroids HNSW and token->centroid `assignments`.
     ///
@@ -244,18 +285,23 @@ impl<const M: usize> Tachiom<M> {
         }
     }
 
-    /// Core build pipeline starting from pre-computed TAC output (steps 2–6).
+    /// Core build pipeline starting from coarse centroids and assignments (steps 2–6).
     ///
     /// Runs PQ sample selection, encoder training, document encoding, HNSW construction,
-    /// and inverted-list assembly.  Called by both `build_index` (after TAC) and
-    /// `build_index_from_tac` (with externally supplied centroids/assignments).
-    fn build_from_tac_parts(
+    /// and inverted-list assembly.  Called by both `build_index` (after clustering) and
+    /// `build_index_from_centroids` (with externally supplied centroids/assignments).
+    ///
+    /// `pq_token_ids` stratifies the PQ training sample by token type; when empty, the
+    /// sample is drawn uniformly.
+    #[allow(clippy::too_many_arguments)]
+    fn build_from_clustering(
         centroids_f16: Vec<f16>,
         n_centroids: usize,
         assignments_usize: Vec<usize>,
         flat_f16: &[f16],
         token_dim: usize,
         doc_token_counts: &[usize],
+        pq_token_ids: &[usize],
         params: &TachiomBuildParams,
     ) -> Self {
         let n_docs = doc_token_counts.len();
@@ -278,10 +324,16 @@ impl<const M: usize> Tachiom<M> {
 
             let sample_indices: Vec<usize> = if train_n >= n_tokens {
                 (0..n_tokens).collect()
+            } else if pq_token_ids.is_empty() {
+                // No token types to stratify by: uniform sample.
+                let mut rng = StdRng::seed_from_u64(42);
+                let mut out = rand::seq::index::sample(&mut rng, n_tokens, train_n).into_vec();
+                out.sort_unstable();
+                out
             } else {
                 // Group indices by token type.
                 let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
-                for (idx, &tid) in params.token_ids.iter().enumerate() {
+                for (idx, &tid) in pq_token_ids.iter().enumerate() {
                     groups.entry(tid).or_default().push(idx);
                 }
 
@@ -519,14 +571,20 @@ impl<const M: usize> Tachiom<M> {
         )
     }
 
-    /// Build a Tachiom index from pre-computed TAC coarse centroids and assignments.
+    /// Build a Tachiom index from externally computed coarse centroids and assignments.
     ///
-    /// Skips Token-Aware Clustering and runs PQ training, encoding, HNSW construction,
-    /// and inverted-list assembly using the supplied centroids and assignments.
-    /// Useful for isolating whether retrieval differences stem from the clustering step
-    /// or the residual/PQ encoding step.
-    pub fn build_index_from_tac(
-        centroids_f16: Vec<f16>,
+    /// Skips clustering and runs PQ training, encoding, HNSW construction, and inverted-list
+    /// assembly using the supplied f32 centroids (`n_centroids × dim`, in the same space as
+    /// the input vectors) and per-token assignments.  Centroids are stored as f16 after
+    /// centering, so they are rounded once.  With `params.center_dataset`, the vectors
+    /// and the centroids are both shifted by the dataset mean, which leaves k-means-style
+    /// assignments valid and matches what [`build_index`](Self::build_index) does.
+    ///
+    /// # Panics
+    /// Panics if the centroid buffer is not `n_centroids × dim`, if `assignments` does not
+    /// have one entry per token, or if an assignment is `>= n_centroids`.
+    pub fn build_index_from_centroids(
+        centroids_f32: &[f32],
         n_centroids: usize,
         assignments_usize: Vec<usize>,
         dataset: TachiomInputDataset,
@@ -534,29 +592,67 @@ impl<const M: usize> Tachiom<M> {
     ) -> Self {
         let token_dim = dataset.encoder().input_dim();
         let flat_f16: &[f16] = dataset.values();
+        let n_tokens = flat_f16.len() / token_dim;
         let doc_token_counts: Vec<usize> = dataset
             .offsets()
             .windows(2)
             .map(|w| (w[1] - w[0]) / token_dim)
             .collect();
 
+        assert_eq!(
+            centroids_f32.len(),
+            n_centroids * token_dim,
+            "centroids must be n_centroids ({n_centroids}) × dim ({token_dim})"
+        );
+        assert_eq!(
+            assignments_usize.len(),
+            n_tokens,
+            "assignments length ({}) must equal n_tokens ({n_tokens})",
+            assignments_usize.len()
+        );
+        assert!(
+            assignments_usize.iter().all(|&a| a < n_centroids),
+            "assignments must be < n_centroids ({n_centroids})"
+        );
+
         println!(
-            "[Tachiom::build_index_from_tac] {} docs, {} tokens, dim={}, {} centroids",
+            "[Tachiom::build_index_from_centroids] {} docs, {} tokens, dim={}, {} centroids",
             doc_token_counts.len(),
-            flat_f16.len() / token_dim,
+            n_tokens,
             token_dim,
             n_centroids
         );
 
-        Self::build_from_tac_parts(
+        let (centered_buf, dataset_mean) = if params.center_dataset {
+            let (centered, mean) = center_tokens(flat_f16, token_dim);
+            (Some(centered), Some(mean))
+        } else {
+            (None, None)
+        };
+        let centroids_f16: Vec<f16> = match &dataset_mean {
+            Some(mean) => centroids_f32
+                .chunks_exact(token_dim)
+                .flat_map(|c| {
+                    c.iter()
+                        .zip(mean.iter())
+                        .map(|(&v, &m)| f16::from_f32(v - m))
+                })
+                .collect(),
+            None => centroids_f32.iter().map(|&v| f16::from_f32(v)).collect(),
+        };
+
+        let mut tachiom = Self::build_from_clustering(
             centroids_f16,
             n_centroids,
             assignments_usize,
-            flat_f16,
+            centered_buf.as_deref().unwrap_or(flat_f16),
             token_dim,
             &doc_token_counts,
+            &params.token_ids,
             params,
-        )
+        );
+        tachiom.dataset_mean = dataset_mean;
+        tachiom
     }
 
     /// Stage 1: accumulate per-doc coarse scores across all query tokens.
@@ -853,24 +949,21 @@ impl<const M: usize> Tachiom<M> {
 
 /// Parameters controlling how a [`Tachiom`] index is built.
 pub struct TachiomBuildParams {
-    /// Token-type IDs for TAC, one per token in dataset order.
+    /// Token-type IDs, one per token in dataset order, or empty if unavailable.
     ///
     /// `token_ids[i]` is the vocabulary / token-type id of the i-th token in
-    /// the flattened dataset (documents concatenated in order).  TAC uses these
-    /// to allocate the centroid budget proportionally across token types.
+    /// the flattened dataset (documents concatenated in order).  Required by
+    /// [`Clustering::Tac`], which allocates the centroid budget across token types
+    /// and also stratifies the PQ training sample by token type.  Ignored by
+    /// [`Clustering::KMeans`], which always samples the PQ training set uniformly.
+    /// [`Tachiom::build_index_from_centroids`] stratifies by them when present.
     pub token_ids: Vec<usize>,
 
     /// Total coarse-centroid budget (number of IVF clusters).
     pub total_centroids: usize,
 
-    /// K-means iterations per token type inside TAC (default: 10).
-    pub tac_n_iter: usize,
-
-    /// Token groups smaller than this receive 1 centroid each (`None` = use TAC default of 128).
-    pub tac_micro_threshold: Option<usize>,
-
-    /// Token groups in [micro, small) receive 2 centroids each (`None` = use TAC default of 256).
-    pub tac_small_threshold: Option<usize>,
+    /// How the coarse centroids are computed (default: TAC).
+    pub clustering: Clustering,
 
     /// Number of tokens sampled for PQ training.
     pub pq_sample_size: usize,
@@ -898,9 +991,7 @@ impl Default for TachiomBuildParams {
         Self {
             token_ids: Vec::new(),
             total_centroids: 4_194_304,
-            tac_n_iter: 10,
-            tac_micro_threshold: None,
-            tac_small_threshold: None,
+            clustering: Clustering::Tac(TacParams::default()),
             pq_sample_size: 10_000_000,
             pq_n_iter: 10,
             normalize: false,
@@ -909,6 +1000,36 @@ impl Default for TachiomBuildParams {
                 .with_num_neighbors(32)
                 .with_ef_construction(1500),
             center_dataset: true,
+        }
+    }
+}
+
+/// Coarse-clustering method used by [`Tachiom::build_index`].
+pub enum Clustering {
+    /// Token-Aware Clustering: per-token-type k-means (needs `token_ids`).
+    Tac(TacParams),
+    /// One k-means over all token vectors, ignoring token ids.
+    KMeans(KMeansParams),
+}
+
+/// Parameters for [`Clustering::Tac`].
+pub struct TacParams {
+    /// K-means iterations per token type (default: 10).
+    pub n_iter: usize,
+
+    /// Token groups smaller than this receive 1 centroid each (`None` = use TAC default of 128).
+    pub micro_threshold: Option<usize>,
+
+    /// Token groups in [micro, small) receive 2 centroids each (`None` = use TAC default of 256).
+    pub small_threshold: Option<usize>,
+}
+
+impl Default for TacParams {
+    fn default() -> Self {
+        Self {
+            n_iter: 10,
+            micro_threshold: None,
+            small_threshold: None,
         }
     }
 }
@@ -1010,81 +1131,69 @@ impl<const M: usize> Tachiom<M> {
         // ── Optional: mean-center the dataset ────────────────────────────────
         // Scores shift by -<mean, query> (same constant for every doc), so rankings are unchanged.
         let (centered_buf, dataset_mean) = if params.center_dataset {
-            use rayon::prelude::*;
             println!("[Tachiom::build_index] Computing dataset mean for centering...");
-            let center_start = Instant::now();
-            let mean_f64: Vec<f64> = flat_f16
-                .par_chunks_exact(token_dim)
-                .fold(
-                    || vec![0.0f64; token_dim],
-                    |mut acc, chunk| {
-                        acc.iter_mut()
-                            .zip(chunk)
-                            .for_each(|(a, &v)| *a += v.to_f32() as f64);
-                        acc
-                    },
-                )
-                .reduce(
-                    || vec![0.0f64; token_dim],
-                    |mut a, b| {
-                        a.iter_mut().zip(&b).for_each(|(x, y)| *x += y);
-                        a
-                    },
-                );
-            let n = n_tokens as f64;
-            let mean_f32: Box<[f32]> = mean_f64.iter().map(|&m| (m / n) as f32).collect();
-            let centered: Vec<f16> = flat_f16
-                .par_chunks_exact(token_dim)
-                .flat_map_iter(|chunk| {
-                    chunk
-                        .iter()
-                        .zip(mean_f32.iter())
-                        .map(|(&v, &m)| f16::from_f32(v.to_f32() - m))
-                })
-                .collect();
-            crate::timing::report("center_dataset", center_start);
-            (Some(centered), Some(mean_f32))
+            let (centered, mean) = center_tokens(flat_f16, token_dim);
+            (Some(centered), Some(mean))
         } else {
             (None, None)
         };
         let flat_f16_ref: &[f16] = centered_buf.as_deref().unwrap_or(flat_f16);
 
-        // ── Step 1: Token-Aware Clustering ───────────────────────────────────
-        assert_eq!(
-            params.token_ids.len(),
-            n_tokens,
-            "token_ids length ({}) must equal n_tokens ({})",
-            params.token_ids.len(),
-            n_tokens
-        );
-        println!("[Tachiom::build_index] Step 1: Token-Aware Clustering...");
-        let mut tac_builder = TacBuilder::new().n_iter(params.tac_n_iter);
-        if let Some(v) = params.tac_micro_threshold {
-            tac_builder = tac_builder.micro_threshold(v);
-        }
-        if let Some(v) = params.tac_small_threshold {
-            tac_builder = tac_builder.small_threshold(v);
-        }
-        let tac = tac_builder.build();
-        let tac_result = tac.train(
-            flat_f16_ref,
-            token_dim,
-            &params.token_ids,
-            params.total_centroids,
-        );
-        let n_centroids = tac_result.n_centroids;
-        let assignments_usize: Vec<usize> =
-            tac_result.assignments.iter().map(|&x| x as usize).collect();
-        let centroids_f16 = tac_result.centroids;
+        // ── Step 1: Coarse clustering ────────────────────────────────────────
+        let (centroids_f16, n_centroids, assignments, pq_token_ids) = match &params.clustering {
+            Clustering::Tac(tac_params) => {
+                assert_eq!(
+                    params.token_ids.len(),
+                    n_tokens,
+                    "token_ids length ({}) must equal n_tokens ({})",
+                    params.token_ids.len(),
+                    n_tokens
+                );
+                println!("[Tachiom::build_index] Step 1: Token-Aware Clustering...");
+                let mut tac_builder = TacBuilder::new().n_iter(tac_params.n_iter);
+                if let Some(v) = tac_params.micro_threshold {
+                    tac_builder = tac_builder.micro_threshold(v);
+                }
+                if let Some(v) = tac_params.small_threshold {
+                    tac_builder = tac_builder.small_threshold(v);
+                }
+                let r = tac_builder.build().train(
+                    flat_f16_ref,
+                    token_dim,
+                    &params.token_ids,
+                    params.total_centroids,
+                );
+                (
+                    r.centroids,
+                    r.n_centroids,
+                    r.assignments,
+                    &params.token_ids[..],
+                )
+            }
+            Clustering::KMeans(kmeans_params) => {
+                println!("[Tachiom::build_index] Step 1: k-means clustering...");
+                let r = train_kmeans(
+                    flat_f16_ref,
+                    token_dim,
+                    params.total_centroids,
+                    kmeans_params,
+                );
+                // k-means has no per-type budget for a stratified sample to follow,
+                // so token ids are ignored and the PQ sample is drawn uniformly.
+                (r.centroids, r.n_centroids, r.assignments, &[][..])
+            }
+        };
+        let assignments_usize: Vec<usize> = assignments.iter().map(|&x| x as usize).collect();
 
         // ── Steps 2–6: PQ training, encoding, HNSW, inverted lists ──────────────
-        let mut tachiom = Self::build_from_tac_parts(
+        let mut tachiom = Self::build_from_clustering(
             centroids_f16,
             n_centroids,
             assignments_usize,
             flat_f16_ref,
             token_dim,
             &doc_token_counts,
+            pq_token_ids,
             params,
         );
         tachiom.dataset_mean = dataset_mean;

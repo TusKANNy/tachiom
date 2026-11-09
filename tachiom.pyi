@@ -25,7 +25,7 @@ class Tac:
         tac.train("vectors.npy", "token_ids.npy")
 
         # Feed directly into Tachiom (no temp files needed)
-        index = Tachiom.build_from_tac(
+        index = Tachiom.build_from_centroids(
             "vectors.npy", "token_ids.npy", "doclens.npy",
             centroids_path=..., assignments_path=...,
         )
@@ -98,6 +98,92 @@ class Tac:
     def __repr__(self) -> str: ...
 
 
+class KMeans:
+    """Global k-means over all token vectors, ignoring token ids.
+
+    The clustering step of ``Tachiom.build(..., clustering="kmeans")``, usable on
+    its own to inspect centroids or to cluster once and build many indexes::
+
+        km = KMeans(assign="hnsw")
+        km.train("vectors.npy")
+        np.save("centroids.npy", km.centroids)
+        np.save("assignments.npy", km.assignments)
+        index = Tachiom.build_from_centroids(
+            "vectors.npy", None, "doclens.npy", "centroids.npy", "assignments.npy",
+        )
+    """
+
+    def __init__(
+        self,
+        n_centroids: int | None = None,
+        *,
+        n_iter: int | None = None,
+        points_per_centroid: int | None = None,
+        seed: int | None = None,
+        assign: str | None = None,
+        hnsw_m: int | None = None,
+        hnsw_ef_construction: int | None = None,
+        hnsw_ef_search: int | None = None,
+    ) -> None:
+        """
+        All arguments default to None, which selects:
+            n_centroids:          auto (2^round(log2(n_tokens/128)))
+            n_iter:               10
+            points_per_centroid:  64 (train on min(N, 64 × n_centroids) sampled tokens)
+            seed:                 42
+            assign:               "hnsw"
+            hnsw_m:               32
+            hnsw_ef_construction: 200
+            hnsw_ef_search:       16
+
+        Args:
+            n_centroids: Number of centroids (> 0).
+            n_iter: Lloyd iterations.
+            points_per_centroid: Training-sample size as a multiple of n_centroids (> 0);
+                every token is assigned to its nearest centroid afterwards.
+            seed: Seed for sampling and initialisation.
+            assign: Nearest-centroid search: "flat" (exhaustive, exact) or "hnsw"
+                (HNSW over the centroids, rebuilt each iteration).
+            hnsw_m, hnsw_ef_construction, hnsw_ef_search: HNSW parameters for
+                assign="hnsw"; passing them with assign="flat" raises ValueError.
+        """
+        ...
+
+    def train(self, vectors_path: str) -> None:
+        """Run k-means on a .npy file of [N, dim] f16 token vectors.
+
+        May be called multiple times; each call overwrites the previous result.
+        """
+        ...
+
+    @property
+    def centroids(self) -> NDArray[np.float32]:
+        """Centroids as f32, shape [n_centroids, dim]. Available after train()."""
+        ...
+
+    @property
+    def centroids_f16(self) -> NDArray[np.float16]:
+        """Centroids as f16 (raw), shape [n_centroids, dim]. Available after train()."""
+        ...
+
+    @property
+    def assignments(self) -> NDArray[np.uint32]:
+        """Per-token centroid assignment, shape [n_tokens]. Available after train()."""
+        ...
+
+    @property
+    def n_centroids(self) -> int:
+        """Number of centroids produced. Available after train()."""
+        ...
+
+    @property
+    def dim(self) -> int:
+        """Token-vector dimensionality. Available after train()."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+
 class Tachiom:
     """IVF-PQ index for late-interaction multivector retrieval."""
 
@@ -107,13 +193,21 @@ class Tachiom:
     def build(
         cls,
         vectors_path: str,
-        token_ids_path: str,
+        token_ids_path: str | None,
         doclens_path: str,
         *,
         total_centroids: int | None = None,
+        clustering: str = "tac",
         tac_n_iter: int | None = None,
         tac_micro_threshold: int | None = None,
         tac_small_threshold: int | None = None,
+        kmeans_n_iter: int | None = None,
+        kmeans_points_per_centroid: int | None = None,
+        kmeans_seed: int | None = None,
+        kmeans_assign: str | None = None,
+        kmeans_hnsw_m: int | None = None,
+        kmeans_hnsw_ef_construction: int | None = None,
+        kmeans_hnsw_ef_search: int | None = None,
         pq_sample_size: int | None = None,
         pq_n_iter: int | None = None,
         normalize: bool | None = None,
@@ -123,13 +217,27 @@ class Tachiom:
         pq_subspaces: int = 32,
         center_dataset: bool = True,
     ) -> Tachiom:
-        """Build an index from .npy inputs (full pipeline: TAC → PQ → HNSW).
+        """Build an index from .npy inputs (full pipeline: clustering → PQ → HNSW).
+
+        ``clustering`` selects how coarse centroids are computed:
+            "tac":    Token-Aware Clustering, per-token-type k-means. Needs token ids.
+            "kmeans": one k-means over all tokens, ignoring token ids (e.g. for
+                      multilingual or multimodal corpora). ``token_ids_path`` may be
+                      None and is ignored when given: the PQ training sample is
+                      always drawn uniformly. Prefer "tac" when token ids are
+                      meaningful; "kmeans" is the fallback when they are not.
+        ``tac_*`` arguments apply only to "tac" and ``kmeans_*`` only to "kmeans";
+        passing the other method's arguments raises ValueError. See ``KMeans``
+        for the meaning of the ``kmeans_*`` arguments.
 
         All keyword arguments default to None, which selects the built-in default:
-            total_centroids:     auto (2^round(log2(n_tokens/128)), floored to TAC minimum)
+            total_centroids:     auto (2^round(log2(n_tokens/128)); for "tac" also
+                                 floored to the TAC minimum)
             tac_n_iter:          10
             tac_micro_threshold: auto (2^round(log2(n_tokens^0.25)) clamped to [32, 128])
             tac_small_threshold: auto (2 × tac_micro_threshold)
+            kmeans_*:            see KMeans (n_iter=10, points_per_centroid=64,
+                                 seed=42, assign="hnsw", hnsw m=32/ef_c=200/ef_s=16)
             pq_sample_size:      10_000_000
             pq_n_iter:           10
             normalize:           True (L2-normalise residuals before PQ encoding)
@@ -145,13 +253,21 @@ class Tachiom:
     def build_from_arrays(
         cls,
         vectors: NDArray[np.uint16],
-        token_ids: NDArray[np.uint32],
+        token_ids: NDArray[np.uint32] | None,
         doclens: NDArray[np.int32],
         *,
         total_centroids: int | None = None,
+        clustering: str = "tac",
         tac_n_iter: int | None = None,
         tac_micro_threshold: int | None = None,
         tac_small_threshold: int | None = None,
+        kmeans_n_iter: int | None = None,
+        kmeans_points_per_centroid: int | None = None,
+        kmeans_seed: int | None = None,
+        kmeans_assign: str | None = None,
+        kmeans_hnsw_m: int | None = None,
+        kmeans_hnsw_ef_construction: int | None = None,
+        kmeans_hnsw_ef_search: int | None = None,
         pq_sample_size: int | None = None,
         pq_n_iter: int | None = None,
         normalize: bool | None = None,
@@ -161,7 +277,7 @@ class Tachiom:
         pq_subspaces: int = 32,
         center_dataset: bool = True,
     ) -> Tachiom:
-        """Build an index from in-memory numpy arrays (full pipeline: TAC → PQ → HNSW).
+        """Build an index from in-memory numpy arrays (full pipeline: clustering → PQ → HNSW).
 
         Equivalent to build() but accepts numpy arrays instead of file paths.
         Supports memory-mapped arrays (np.load(..., mmap_mode='r')) to minimise RAM
@@ -172,16 +288,17 @@ class Tachiom:
             vectors:   [N, dim] uint16, C-contiguous.  The u16 bit patterns are
                        reinterpreted as IEEE-754 f16 values, matching the on-disk
                        format written by the indexing pipeline.
-            token_ids: [N] u32, vocabulary id per token.
+            token_ids: [N] u32, vocabulary id per token, or None (clustering="kmeans" only;
+                       ignored by "kmeans" when given).
             doclens:   [n_docs] i32, tokens per document.
         """
         ...
 
     @classmethod
-    def build_from_tac(
+    def build_from_centroids(
         cls,
         vectors_path: str,
-        token_ids_path: str,
+        token_ids_path: str | None,
         doclens_path: str,
         centroids_path: str,
         assignments_path: str,
@@ -193,17 +310,56 @@ class Tachiom:
         hnsw_m: int | None = None,
         ef_construction: int | None = None,
         pq_subspaces: int = 32,
+        center_dataset: bool = True,
     ) -> Tachiom:
-        """Build an index using pre-computed coarse centroids and assignments.
+        """Build an index from externally computed coarse centroids and assignments.
 
-        Skips Token-Aware Clustering and runs PQ training + encoding from
-        scratch.  Useful for isolating retrieval differences between the
-        clustering step and the residual/PQ encoding step.
-        All keyword arguments default to None — see build() for the resolved defaults.
+        Skips clustering (e.g. output of ``Tac``, ``KMeans``, or any other k-means)
+        and runs PQ training + encoding from scratch.  ``token_ids_path`` may be
+        None, in which case the PQ training sample is drawn uniformly.
+
+        Centroids must live in the same space as the input vectors (i.e. computed
+        on the raw, uncentered vectors).  With ``center_dataset=True`` (default,
+        as in ``build()``), the vectors and the centroids are both shifted by the
+        dataset mean, which leaves the assignments valid.
+        All other keyword arguments default to None — see build() for the resolved defaults.
 
         Args:
             centroids_path:   .npy file, [K, dim] f32 coarse centroids.
-            assignments_path: .npy file, [N] u32/u64 centroid id per token.
+            assignments_path: .npy file, [N] u32/u64 centroid id per token (< K).
+
+        Raises:
+            ValueError: on a centroid dim mismatch, a wrong assignments length, or
+                an assignment >= K.
+        """
+        ...
+
+    @classmethod
+    def build_from_centroids_arrays(
+        cls,
+        vectors: NDArray[np.uint16],
+        token_ids: NDArray[np.uint32] | None,
+        doclens: NDArray[np.int32],
+        centroids: NDArray[np.float32],
+        assignments: NDArray[np.uint32],
+        *,
+        pq_sample_size: int | None = None,
+        pq_n_iter: int | None = None,
+        normalize: bool | None = None,
+        pq_seed: int | None = None,
+        hnsw_m: int | None = None,
+        ef_construction: int | None = None,
+        pq_subspaces: int = 32,
+        center_dataset: bool = True,
+    ) -> Tachiom:
+        """In-memory variant of build_from_centroids().
+
+        Args:
+            vectors:     [N, dim] uint16 (f16 bit patterns), C-contiguous; as build_from_arrays().
+            token_ids:   [N] u32, or None.
+            doclens:     [n_docs] i32.
+            centroids:   [K, dim] f32, C-contiguous.
+            assignments: [N] u32, centroid id per token (< K).
         """
         ...
 

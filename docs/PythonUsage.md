@@ -7,7 +7,7 @@ RUSTFLAGS="-C target-cpu=native" maturin develop --release
 ```
 
 ```python
-import tachiom  # exposes: tachiom.Tachiom, tachiom.Tac
+import tachiom  # exposes: tachiom.Tachiom, tachiom.Tac, tachiom.KMeans
 ```
 
 ---
@@ -19,7 +19,7 @@ All `.npy` inputs use C-contiguous (row-major) layout.
 | File | Shape | Dtype | Description |
 |---|---|---|---|
 | `vectors.npy` | `[N, dim]` | `f16` | One row per token across all documents |
-| `token_ids.npy` | `[N]` | `i64` or `u32` | Vocabulary id of each token |
+| `token_ids.npy` | `[N]` | `i64` or `u32` | Vocabulary id of each token (required for TAC, ignored by k-means) |
 | `doclens.npy` | `[n_docs]` | `i32` or `i64` | Number of tokens per document |
 
 Tokens must be concatenated in document order: the first `doclens[0]` rows in `vectors.npy` belong to document 0, the next `doclens[1]` to document 1, and so on.
@@ -49,6 +49,41 @@ index = tachiom.Tachiom.build(
 )
 ```
 
+#### Choosing the clustering method
+
+`clustering` selects how the coarse centroids are computed:
+
+| `clustering` | Method | Token ids |
+|---|---|---|
+| `"tac"` (default) | Token-Aware Clustering: per-token-type k-means | required |
+| `"kmeans"` | One k-means over all tokens | ignored |
+
+**Use TAC whenever you have meaningful token ids.** TAC relies on them being vocabulary ids;
+`"kmeans"` is the fallback for when they are not — multilingual vocabularies, image patches,
+or no token ids at all. Arguments prefixed
+`tac_` apply only to TAC and `kmeans_` only to k-means; mixing them raises `ValueError`.
+
+```python
+index = tachiom.Tachiom.build(
+    vectors_path,
+    None,                        # token ids: ignored by k-means
+    doclens_path,
+    clustering="kmeans",
+    kmeans_n_iter=10,            # Lloyd iterations
+    kmeans_points_per_centroid=64,  # train on min(N, 64 × total_centroids) sampled tokens
+    kmeans_assign="hnsw",        # nearest-centroid search: "hnsw" or "flat" (exact)
+    kmeans_hnsw_m=32,            # HNSW parameters (assign="hnsw" only)
+    kmeans_hnsw_ef_construction=200,
+    kmeans_hnsw_ef_search=16,
+)
+```
+
+`kmeans_assign="flat"` scans every centroid for every token — exact, but `O(N · K · d)` per
+iteration, so only practical for small corpora. `"hnsw"` rebuilds an HNSW over the centroids
+at each iteration and scales to millions of centroids. With `"kmeans"`, token ids are ignored
+even when given, and the PQ training sample is drawn uniformly. (TAC stratifies it by token
+type to follow its per-type centroid budget; k-means has no such budget.)
+
 #### Stage timings
 
 Setting `TACHIOM_TIMINGS=1` makes the build print one `[timing] <stage>: <elapsed>` line per
@@ -66,17 +101,19 @@ For the same reason, when stdout is piped rather than attached to a terminal, th
 appear out of order relative to Python `print()` calls: Rust flushes per line while Python
 block-buffers. Run with `python -u` (or `print(..., flush=True)`) if interleaved order matters.
 
-#### From pre-computed TAC output
+#### From pre-computed clustering output
 
-If you have already run TAC (e.g. to inspect centroids or tune the centroid budget separately), skip the clustering step:
+If you have already clustered the vectors — with `Tac`, `KMeans`, or any other implementation such
+as a GPU k-means — skip the clustering step. `token_ids_path` may be `None`:
 
 ```python
-index = tachiom.Tachiom.build_from_tac(
+index = tachiom.Tachiom.build_from_centroids(
     vectors_path,
-    token_ids_path,
+    token_ids_path,    # or None
     doclens_path,
     centroids_path,    # [K, dim] f32 .npy
-    assignments_path,  # [N]      u32 .npy
+    assignments_path,  # [N]      u32 .npy, values < K
+    center_dataset=True,  # as in build(): shift vectors and centroids by the dataset mean
     pq_sample_size=10_000_000,
     pq_n_iter=10,
     normalize=True,
@@ -85,7 +122,16 @@ index = tachiom.Tachiom.build_from_tac(
     ef_construction=1500,
     pq_subspaces=32,
 )
+
+# Same, from in-memory arrays (vectors as uint16 f16 bit patterns, like build_from_arrays):
+index = tachiom.Tachiom.build_from_centroids_arrays(
+    vectors_u16, token_ids_or_none, doclens, centroids_f32, assignments_u32,
+)
 ```
+
+Centroids must be computed on the raw (uncentered) vectors. With `center_dataset=True` (the
+default), both are shifted by the dataset mean before building, so the result matches what
+`build()` produces from the same clustering.
 
 ### Saving and loading
 
@@ -193,9 +239,36 @@ import numpy as np
 np.save("centroids.npy",   tac.centroids)
 np.save("assignments.npy", tac.assignments)
 
-index = tachiom.Tachiom.build_from_tac(
+index = tachiom.Tachiom.build_from_centroids(
     "vectors.npy", "token_ids.npy", "doclens.npy",
     "centroids.npy", "assignments.npy",
+)
+```
+
+---
+
+## `KMeans` — global k-means
+
+`KMeans` is the clustering step of `clustering="kmeans"`. It takes the same arguments as the
+`kmeans_*` build arguments, without the prefix.
+
+```python
+km = tachiom.KMeans(
+    n_centroids=None,          # None = auto (2^round(log2(N/128)))
+    n_iter=10,
+    points_per_centroid=64,
+    seed=42,
+    assign="hnsw",             # or "flat"
+    hnsw_m=32, hnsw_ef_construction=200, hnsw_ef_search=16,
+)
+km.train("vectors.npy")
+
+km.centroids, km.centroids_f16, km.assignments, km.n_centroids, km.dim
+
+np.save("centroids.npy",   km.centroids)
+np.save("assignments.npy", km.assignments)
+index = tachiom.Tachiom.build_from_centroids(
+    "vectors.npy", None, "doclens.npy", "centroids.npy", "assignments.npy",
 )
 ```
 
