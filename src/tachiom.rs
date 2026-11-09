@@ -1232,6 +1232,43 @@ impl<const M: usize> Index for Tachiom<M> {
 }
 
 impl<const M: usize> IndexSerializer for Tachiom<M> {
+    fn save_index(&self, filename: &str) -> Result<(), vectorium::IndexIoError> {
+        use std::fs::File;
+        use std::io::{BufWriter, Write};
+
+        let mut writer = BufWriter::new(File::create(filename)?);
+        let config = bincode::config::standard()
+            .with_fixed_int_encoding()
+            .with_little_endian();
+        let data = self.residuals.values();
+        // Keep the field order used by the derived serializer. The residual data is
+        // a u64 length followed by the raw bytes, so we encode its length here and
+        // write the bytes directly below.
+        bincode::serde::encode_into_std_write(
+            (
+                &self.centroids,
+                &self.inverted_lists,
+                &self.offsets,
+                data.len(),
+            ),
+            &mut writer,
+            config,
+        )?;
+        writer.write_all(data)?;
+        bincode::serde::encode_into_std_write(
+            (
+                self.residuals.offsets(),
+                self.residuals.encoder(),
+                self.max_doc_tokens,
+                &self.dataset_mean,
+            ),
+            &mut writer,
+            config,
+        )?;
+        writer.flush()?;
+        Ok(())
+    }
+
     fn load_index(filename: &str) -> Result<Self, vectorium::IndexIoError> {
         crate::fast_load::load_index::<M>(filename)
     }

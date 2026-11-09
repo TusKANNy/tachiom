@@ -541,8 +541,17 @@ mod tests {
         for center in [false, true] {
             for normalize in [false, true] {
                 let path = temp_path("equivalence");
-                build_fixture(center, normalize).save_index(&path).unwrap();
+                let index = build_fixture(center, normalize);
+                index.save_index(&path).unwrap();
                 let original = std::fs::read(&path).unwrap();
+                assert_eq!(
+                    original,
+                    bincode::serde::encode_to_vec(&index, config()).unwrap()
+                );
+                assert!(matches!(
+                    index.save_index(&format!("{path}/child")),
+                    Err(IndexIoError::Io(_))
+                ));
 
                 let legacy = legacy_load_index::<M>(&path);
                 let fast = Tachiom::<M>::load_index(&path).unwrap();
@@ -560,6 +569,11 @@ mod tests {
                     "fixture searches returned nothing, the comparison would be vacuous"
                 );
                 assert_eq!(fast_hits, search_all(&legacy, &qs), "search results differ");
+                assert_eq!(
+                    fast_hits,
+                    search_all(&index, &qs),
+                    "round-trip search differs"
+                );
 
                 std::fs::remove_file(&path).unwrap();
             }
