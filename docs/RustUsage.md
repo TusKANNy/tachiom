@@ -78,7 +78,7 @@ Runs the full pipeline (clustering → PQ training → encoding → HNSW) and sa
 | Flag | Default | Description |
 |---|---|---|
 | `-i`, `--vectors-file` | *(required)* | `[N, dim]` f16 token vectors |
-| `--token-ids-file` | *(required for TAC)* | `[N]` token-type IDs (i64 or u32); optional for k-means, where it only stratifies the PQ sample |
+| `--token-ids-file` | *(required for TAC)* | `[N]` token-type IDs (i64 or u32); ignored by k-means, which samples the PQ training set uniformly |
 | `--doclens-file` | *(required)* | `[n_docs]` document lengths (i32 or i64) |
 | `-o`, `--output-file` | *(required)* | Output path for the serialized index |
 | `--total-centroids` | `4194304` | Coarse-centroid budget |

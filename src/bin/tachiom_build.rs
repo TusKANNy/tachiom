@@ -33,7 +33,7 @@ struct Args {
     vectors_file: String,
 
     /// Path to the token-type ID file (.npy, dtype i64 or u32, shape [N]).
-    /// Required for TAC; optional for k-means (stratifies the PQ sample when given).
+    /// Required for TAC; ignored by k-means, which samples the PQ training set uniformly.
     #[clap(long)]
     token_ids_file: Option<String>,
 
@@ -142,6 +142,11 @@ fn main() -> anyhow::Result<()> {
     if args.pq_subspaces != 32 {
         anyhow::bail!("Only --pq-subspaces 32 is currently supported");
     }
+    anyhow::ensure!(args.total_centroids > 0, "--total-centroids must be > 0");
+    anyhow::ensure!(
+        args.kmeans_points_per_centroid > 0,
+        "--kmeans-points-per-centroid must be > 0"
+    );
 
     println!("=== Tachiom Build ===");
     println!("Vectors:         {}", args.vectors_file);
@@ -172,10 +177,16 @@ fn main() -> anyhow::Result<()> {
     );
 
     // ── Load token type IDs ───────────────────────────────────────────────────
-    println!("Loading token IDs...");
-    let token_ids = match &args.token_ids_file {
-        Some(path) => read_token_ids_npy(path)?,
-        None => Vec::new(),
+    let token_ids = match (&args.token_ids_file, &args.clustering) {
+        (Some(_), ClusteringArg::Kmeans) => {
+            println!("Token IDs are ignored with --clustering kmeans; not loading them.");
+            Vec::new()
+        }
+        (Some(path), ClusteringArg::Tac) => {
+            println!("Loading token IDs...");
+            read_token_ids_npy(path)?
+        }
+        (None, _) => Vec::new(),
     };
     anyhow::ensure!(
         token_ids.is_empty() || token_ids.len() == n_tokens,

@@ -19,7 +19,7 @@ All `.npy` inputs use C-contiguous (row-major) layout.
 | File | Shape | Dtype | Description |
 |---|---|---|---|
 | `vectors.npy` | `[N, dim]` | `f16` | One row per token across all documents |
-| `token_ids.npy` | `[N]` | `i64` or `u32` | Vocabulary id of each token (required for TAC, optional for k-means) |
+| `token_ids.npy` | `[N]` | `i64` or `u32` | Vocabulary id of each token (required for TAC, ignored by k-means) |
 | `doclens.npy` | `[n_docs]` | `i32` or `i64` | Number of tokens per document |
 
 Tokens must be concatenated in document order: the first `doclens[0]` rows in `vectors.npy` belong to document 0, the next `doclens[1]` to document 1, and so on.
@@ -56,16 +56,17 @@ index = tachiom.Tachiom.build(
 | `clustering` | Method | Token ids |
 |---|---|---|
 | `"tac"` (default) | Token-Aware Clustering: per-token-type k-means | required |
-| `"kmeans"` | One k-means over all tokens | optional |
+| `"kmeans"` | One k-means over all tokens | ignored |
 
-TAC relies on token ids being meaningful vocabulary ids. When they are not — multilingual
-vocabularies, image patches, or no token ids at all — use `"kmeans"`. Arguments prefixed
+**Use TAC whenever you have meaningful token ids.** TAC relies on them being vocabulary ids;
+`"kmeans"` is the fallback for when they are not — multilingual vocabularies, image patches,
+or no token ids at all. Arguments prefixed
 `tac_` apply only to TAC and `kmeans_` only to k-means; mixing them raises `ValueError`.
 
 ```python
 index = tachiom.Tachiom.build(
     vectors_path,
-    None,                        # token ids: optional for k-means
+    None,                        # token ids: ignored by k-means
     doclens_path,
     clustering="kmeans",
     kmeans_n_iter=10,            # Lloyd iterations
@@ -79,8 +80,9 @@ index = tachiom.Tachiom.build(
 
 `kmeans_assign="flat"` scans every centroid for every token — exact, but `O(N · K · d)` per
 iteration, so only practical for small corpora. `"hnsw"` rebuilds an HNSW over the centroids
-at each iteration and scales to millions of centroids. When token ids are given with
-`"kmeans"`, they are still used to stratify the PQ training sample; otherwise it is uniform.
+at each iteration and scales to millions of centroids. With `"kmeans"`, token ids are ignored
+even when given, and the PQ training sample is drawn uniformly. (TAC stratifies it by token
+type to follow its per-type centroid budget; k-means has no such budget.)
 
 #### Stage timings
 

@@ -456,7 +456,7 @@ mod tests {
     };
 
     use crate::hnsw::HNSWBuildConfiguration;
-    use crate::tachiom::{TachiomBuildParams, TachiomInputDataset};
+    use crate::tachiom::{Clustering, TacParams, TachiomBuildParams, TachiomInputDataset};
 
     const M: usize = 32;
     const DIM: usize = 64;
@@ -478,9 +478,11 @@ mod tests {
         let params = TachiomBuildParams {
             token_ids: (0..n_tokens).map(|i| i % 97).collect(),
             total_centroids: 128,
-            tac_n_iter: 3,
-            tac_micro_threshold: None,
-            tac_small_threshold: None,
+            clustering: Clustering::Tac(TacParams {
+                n_iter: 3,
+                micro_threshold: None,
+                small_threshold: None,
+            }),
             pq_sample_size: n_tokens,
             pq_n_iter: 3,
             normalize,

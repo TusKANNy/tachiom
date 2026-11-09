@@ -290,13 +290,18 @@ impl<const M: usize> Tachiom<M> {
     /// Runs PQ sample selection, encoder training, document encoding, HNSW construction,
     /// and inverted-list assembly.  Called by both `build_index` (after clustering) and
     /// `build_index_from_centroids` (with externally supplied centroids/assignments).
-    fn build_from_tac_parts(
+    ///
+    /// `pq_token_ids` stratifies the PQ training sample by token type; when empty, the
+    /// sample is drawn uniformly.
+    #[allow(clippy::too_many_arguments)]
+    fn build_from_clustering(
         centroids_f16: Vec<f16>,
         n_centroids: usize,
         assignments_usize: Vec<usize>,
         flat_f16: &[f16],
         token_dim: usize,
         doc_token_counts: &[usize],
+        pq_token_ids: &[usize],
         params: &TachiomBuildParams,
     ) -> Self {
         let n_docs = doc_token_counts.len();
@@ -319,7 +324,7 @@ impl<const M: usize> Tachiom<M> {
 
             let sample_indices: Vec<usize> = if train_n >= n_tokens {
                 (0..n_tokens).collect()
-            } else if params.token_ids.is_empty() {
+            } else if pq_token_ids.is_empty() {
                 // No token types to stratify by: uniform sample.
                 let mut rng = StdRng::seed_from_u64(42);
                 let mut out = rand::seq::index::sample(&mut rng, n_tokens, train_n).into_vec();
@@ -328,7 +333,7 @@ impl<const M: usize> Tachiom<M> {
             } else {
                 // Group indices by token type.
                 let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
-                for (idx, &tid) in params.token_ids.iter().enumerate() {
+                for (idx, &tid) in pq_token_ids.iter().enumerate() {
                     groups.entry(tid).or_default().push(idx);
                 }
 
@@ -636,13 +641,14 @@ impl<const M: usize> Tachiom<M> {
             None => centroids_f32.iter().map(|&v| f16::from_f32(v)).collect(),
         };
 
-        let mut tachiom = Self::build_from_tac_parts(
+        let mut tachiom = Self::build_from_clustering(
             centroids_f16,
             n_centroids,
             assignments_usize,
             centered_buf.as_deref().unwrap_or(flat_f16),
             token_dim,
             &doc_token_counts,
+            &params.token_ids,
             params,
         );
         tachiom.dataset_mean = dataset_mean;
@@ -947,9 +953,10 @@ pub struct TachiomBuildParams {
     ///
     /// `token_ids[i]` is the vocabulary / token-type id of the i-th token in
     /// the flattened dataset (documents concatenated in order).  Required by
-    /// [`Clustering::Tac`], which allocates the centroid budget across token types.
-    /// When present, the PQ training sample is also stratified by token type;
-    /// when empty, it is sampled uniformly.
+    /// [`Clustering::Tac`], which allocates the centroid budget across token types
+    /// and also stratifies the PQ training sample by token type.  Ignored by
+    /// [`Clustering::KMeans`], which always samples the PQ training set uniformly.
+    /// [`Tachiom::build_index_from_centroids`] stratifies by them when present.
     pub token_ids: Vec<usize>,
 
     /// Total coarse-centroid budget (number of IVF clusters).
@@ -1133,7 +1140,7 @@ impl<const M: usize> Tachiom<M> {
         let flat_f16_ref: &[f16] = centered_buf.as_deref().unwrap_or(flat_f16);
 
         // ── Step 1: Coarse clustering ────────────────────────────────────────
-        let (centroids_f16, n_centroids, assignments) = match &params.clustering {
+        let (centroids_f16, n_centroids, assignments, pq_token_ids) = match &params.clustering {
             Clustering::Tac(tac_params) => {
                 assert_eq!(
                     params.token_ids.len(),
@@ -1156,15 +1163,14 @@ impl<const M: usize> Tachiom<M> {
                     &params.token_ids,
                     params.total_centroids,
                 );
-                (r.centroids, r.n_centroids, r.assignments)
+                (
+                    r.centroids,
+                    r.n_centroids,
+                    r.assignments,
+                    &params.token_ids[..],
+                )
             }
             Clustering::KMeans(kmeans_params) => {
-                assert!(
-                    params.token_ids.is_empty() || params.token_ids.len() == n_tokens,
-                    "token_ids length ({}) must be 0 or n_tokens ({})",
-                    params.token_ids.len(),
-                    n_tokens
-                );
                 println!("[Tachiom::build_index] Step 1: k-means clustering...");
                 let r = train_kmeans(
                     flat_f16_ref,
@@ -1172,19 +1178,22 @@ impl<const M: usize> Tachiom<M> {
                     params.total_centroids,
                     kmeans_params,
                 );
-                (r.centroids, r.n_centroids, r.assignments)
+                // k-means has no per-type budget for a stratified sample to follow,
+                // so token ids are ignored and the PQ sample is drawn uniformly.
+                (r.centroids, r.n_centroids, r.assignments, &[][..])
             }
         };
         let assignments_usize: Vec<usize> = assignments.iter().map(|&x| x as usize).collect();
 
         // ── Steps 2–6: PQ training, encoding, HNSW, inverted lists ──────────────
-        let mut tachiom = Self::build_from_tac_parts(
+        let mut tachiom = Self::build_from_clustering(
             centroids_f16,
             n_centroids,
             assignments_usize,
             flat_f16_ref,
             token_dim,
             &doc_token_counts,
+            pq_token_ids,
             params,
         );
         tachiom.dataset_mean = dataset_mean;

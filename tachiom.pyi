@@ -137,9 +137,9 @@ class KMeans:
             hnsw_ef_search:       16
 
         Args:
-            n_centroids: Number of centroids.
+            n_centroids: Number of centroids (> 0).
             n_iter: Lloyd iterations.
-            points_per_centroid: Training-sample size as a multiple of n_centroids;
+            points_per_centroid: Training-sample size as a multiple of n_centroids (> 0);
                 every token is assigned to its nearest centroid afterwards.
             seed: Seed for sampling and initialisation.
             assign: Nearest-centroid search: "flat" (exhaustive, exact) or "hnsw"
@@ -223,7 +223,9 @@ class Tachiom:
             "tac":    Token-Aware Clustering, per-token-type k-means. Needs token ids.
             "kmeans": one k-means over all tokens, ignoring token ids (e.g. for
                       multilingual or multimodal corpora). ``token_ids_path`` may be
-                      None; when given, it still stratifies the PQ training sample.
+                      None and is ignored when given: the PQ training sample is
+                      always drawn uniformly. Prefer "tac" when token ids are
+                      meaningful; "kmeans" is the fallback when they are not.
         ``tac_*`` arguments apply only to "tac" and ``kmeans_*`` only to "kmeans";
         passing the other method's arguments raises ValueError. See ``KMeans``
         for the meaning of the ``kmeans_*`` arguments.
@@ -286,7 +288,8 @@ class Tachiom:
             vectors:   [N, dim] uint16, C-contiguous.  The u16 bit patterns are
                        reinterpreted as IEEE-754 f16 values, matching the on-disk
                        format written by the indexing pipeline.
-            token_ids: [N] u32, vocabulary id per token, or None (clustering="kmeans" only).
+            token_ids: [N] u32, vocabulary id per token, or None (clustering="kmeans" only;
+                       ignored by "kmeans" when given).
             doclens:   [n_docs] i32, tokens per document.
         """
         ...

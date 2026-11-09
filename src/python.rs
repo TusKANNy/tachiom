@@ -219,6 +219,9 @@ impl KMeansKwargs {
 
     fn into_params(self) -> PyResult<KMeansParams> {
         let defaults = KMeansParams::default();
+        if self.points_per_centroid == Some(0) {
+            return Err(PyValueError::new_err("points_per_centroid must be > 0"));
+        }
         let assign = match self.assign.as_deref().unwrap_or("hnsw") {
             "hnsw" => KMeansAssign::Hnsw {
                 build: HNSWBuildConfiguration::default()
@@ -268,6 +271,7 @@ fn resolve_clustering(
     tac: TacKwargs,
     kmeans: KMeansKwargs,
 ) -> PyResult<(Clustering, usize)> {
+    require_nonzero_centroids("total_centroids", total_centroids)?;
     let tac_set =
         tac.n_iter.is_some() || tac.micro_threshold.is_some() || tac.small_threshold.is_some();
     match clustering {
@@ -1283,6 +1287,7 @@ impl PyKMeans {
         hnsw_ef_construction: Option<usize>,
         hnsw_ef_search: Option<usize>,
     ) -> PyResult<Self> {
+        require_nonzero_centroids("n_centroids", n_centroids)?;
         let params = KMeansKwargs {
             n_iter,
             points_per_centroid,
@@ -1309,6 +1314,12 @@ impl PyKMeans {
         let k = self
             .n_centroids
             .unwrap_or_else(|| auto_total_centroids(flat_f16.len() / dim));
+        require_nonzero_centroids("n_centroids", Some(k))?;
+        if flat_f16.is_empty() {
+            return Err(PyValueError::new_err(format!(
+                "{vectors_path} contains no token vectors"
+            )));
+        }
         let params = &self.params;
         self.result = Some(py.allow_threads(|| train_kmeans(&flat_f16, dim, k, params)));
         Ok(())
@@ -1372,6 +1383,15 @@ fn warn_saturation_cap(py: Python<'_>, requested: usize, sat_cap: usize) -> PyRe
     );
     let warnings = py.import("warnings")?;
     warnings.call_method1("warn", (msg,))?;
+    Ok(())
+}
+
+/// Reject a zero centroid budget, which would otherwise trip an assertion in
+/// k-means and abort the process (panics cannot cross the PyO3 boundary).
+fn require_nonzero_centroids(name: &str, value: Option<usize>) -> PyResult<()> {
+    if value == Some(0) {
+        return Err(PyValueError::new_err(format!("{name} must be > 0")));
+    }
     Ok(())
 }
 
