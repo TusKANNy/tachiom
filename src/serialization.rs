@@ -1,7 +1,8 @@
-//! Fast loader for the existing `Tachiom<M>` on-disk format.
+//! Saving and loading Tachiom indexes.
 //!
-//! HNSW is decoded with bincode/serde. The flat sections that follow are read
-//! directly.
+//! Both use bincode/serde for the HNSW index. Loading reads the remaining
+//! fields directly. Saving writes the compressed document bytes directly
+//! and uses serde for everything else.
 //!
 //! Wire layout (little-endian; fixed-int bincode encodes `usize` and lengths
 //! as `u64`):
@@ -30,7 +31,7 @@
 use bincode::error::DecodeError;
 use half::f16;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 use vectorium::core::dataset::Dataset;
 use vectorium::core::index::IndexStats;
@@ -49,7 +50,7 @@ const READ_BUFFER_BYTES: usize = 1 << 20;
 
 const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
-// Must match vectorium::IndexSerializer::save_index.
+// Matches vectorium's default IndexSerializer format.
 fn config() -> impl bincode::config::Config {
     bincode::config::standard()
         .with_fixed_int_encoding()
@@ -313,6 +314,38 @@ fn validate_encoded_documents(
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) fn save_index<const M: usize>(index: &Tachiom<M>, filename: &str) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(filename)?);
+    let config = config();
+    let data = index.residuals.values();
+    // Keep the field order used by the derived serializer. The residual data is
+    // a u64 length followed by the raw bytes, so we encode its length here and
+    // write the bytes directly below.
+    bincode::serde::encode_into_std_write(
+        (
+            &index.centroids,
+            &index.inverted_lists,
+            &index.offsets,
+            data.len(),
+        ),
+        &mut writer,
+        config,
+    )?;
+    writer.write_all(data)?;
+    bincode::serde::encode_into_std_write(
+        (
+            index.residuals.offsets(),
+            index.residuals.encoder(),
+            index.max_doc_tokens,
+            &index.dataset_mean,
+        ),
+        &mut writer,
+        config,
+    )?;
+    writer.flush()?;
     Ok(())
 }
 
