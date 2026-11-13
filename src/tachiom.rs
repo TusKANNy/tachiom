@@ -1232,8 +1232,12 @@ impl<const M: usize> Index for Tachiom<M> {
 }
 
 impl<const M: usize> IndexSerializer for Tachiom<M> {
+    fn save_index(&self, filename: &str) -> Result<(), vectorium::IndexIoError> {
+        crate::serialization::save_index(self, filename)
+    }
+
     fn load_index(filename: &str) -> Result<Self, vectorium::IndexIoError> {
-        crate::fast_load::load_index::<M>(filename)
+        crate::serialization::load_index::<M>(filename)
     }
 }
 

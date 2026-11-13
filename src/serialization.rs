@@ -1,7 +1,8 @@
-//! Fast loader for the existing `Tachiom<M>` on-disk format.
+//! Saving and loading Tachiom indexes.
 //!
-//! HNSW is decoded with bincode/serde. The flat sections that follow are read
-//! directly.
+//! Both use bincode/serde for the HNSW index. Loading reads the remaining
+//! fields directly. Saving writes the compressed document bytes directly
+//! and uses serde for everything else.
 //!
 //! Wire layout (little-endian; fixed-int bincode encodes `usize` and lengths
 //! as `u64`):
@@ -30,7 +31,7 @@
 use bincode::error::DecodeError;
 use half::f16;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 use vectorium::core::dataset::Dataset;
 use vectorium::core::index::IndexStats;
@@ -49,7 +50,7 @@ const READ_BUFFER_BYTES: usize = 1 << 20;
 
 const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
-// Must match vectorium::IndexSerializer::save_index.
+// Matches vectorium's default IndexSerializer format.
 fn config() -> impl bincode::config::Config {
     bincode::config::standard()
         .with_fixed_int_encoding()
@@ -316,6 +317,38 @@ fn validate_encoded_documents(
     Ok(())
 }
 
+pub(crate) fn save_index<const M: usize>(index: &Tachiom<M>, filename: &str) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(filename)?);
+    let config = config();
+    let data = index.residuals.values();
+    // Keep the field order used by the derived serializer. The residual data is
+    // a u64 length followed by the raw bytes, so we encode its length here and
+    // write the bytes directly below.
+    bincode::serde::encode_into_std_write(
+        (
+            &index.centroids,
+            &index.inverted_lists,
+            &index.offsets,
+            data.len(),
+        ),
+        &mut writer,
+        config,
+    )?;
+    writer.write_all(data)?;
+    bincode::serde::encode_into_std_write(
+        (
+            index.residuals.offsets(),
+            index.residuals.encoder(),
+            index.max_doc_tokens,
+            &index.dataset_mean,
+        ),
+        &mut writer,
+        config,
+    )?;
+    writer.flush()?;
+    Ok(())
+}
+
 pub(crate) fn load_index<const M: usize>(path: &str) -> Result<Tachiom<M>> {
     if M == 0 || !M.is_multiple_of(4) {
         return corrupt(format!(
@@ -541,8 +574,17 @@ mod tests {
         for center in [false, true] {
             for normalize in [false, true] {
                 let path = temp_path("equivalence");
-                build_fixture(center, normalize).save_index(&path).unwrap();
+                let index = build_fixture(center, normalize);
+                index.save_index(&path).unwrap();
                 let original = std::fs::read(&path).unwrap();
+                assert_eq!(
+                    original,
+                    bincode::serde::encode_to_vec(&index, config()).unwrap()
+                );
+                assert!(matches!(
+                    index.save_index(&format!("{path}/child")),
+                    Err(IndexIoError::Io(_))
+                ));
 
                 let legacy = legacy_load_index::<M>(&path);
                 let fast = Tachiom::<M>::load_index(&path).unwrap();
@@ -560,6 +602,11 @@ mod tests {
                     "fixture searches returned nothing, the comparison would be vacuous"
                 );
                 assert_eq!(fast_hits, search_all(&legacy, &qs), "search results differ");
+                assert_eq!(
+                    fast_hits,
+                    search_all(&index, &qs),
+                    "round-trip search differs"
+                );
 
                 std::fs::remove_file(&path).unwrap();
             }
